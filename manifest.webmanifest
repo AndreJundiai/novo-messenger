@@ -1,0 +1,12 @@
+{
+  "name": "Novo Messenger",
+  "short_name": "Messenger",
+  "description": "Mensagens sem internet por luz, som e LoRa",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0f1720",
+  "theme_color": "#0f1720",
+  "lang": "pt-BR",
+  "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}
