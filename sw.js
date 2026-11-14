@@ -1,5 +1,5 @@
 // Guarda o app no aparelho para abrir sem internet
-const CACHE = 'novo-messenger-v1';
+const CACHE = 'novo-messenger-v2';
 const FILES = ['./', './index.html', './app.js', './manifest.webmanifest', './icon.svg'];
 self.addEventListener('install', (e) => { e.waitUntil(caches.open(CACHE).then((c) => c.addAll(FILES))); self.skipWaiting(); });
 self.addEventListener('activate', (e) => {

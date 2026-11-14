@@ -19,6 +19,17 @@ Marque mais de um canal: a mensagem sai por todos e o receptor junta as cópias 
 
 Os dois aparelhos precisam usar o mesmo valor de "Bit (ms)" e as mesmas frequências.
 
+## Fases da comunicação
+
+O app tem um painel para testar a ligação passo a passo entre dois aparelhos. Cada canal (Luz, Som, LoRa) fica verde quando passa:
+
+1. **Sinal:** o emissor pisca ou apita 1-0-1-0 por 3 s. O receptor mostra a onda no gráfico e confere o ritmo.
+2. **Bits e bytes:** o emissor manda 7 bytes fixos (`55 AA 0F F0 41 42 43`) e o receptor confere byte a byte.
+3. **Mensagem de teste:** um quadro completo (`TESTE-OK 123`) com checksum.
+4. **Conversa:** uma mensagem livre de verdade.
+
+O **Registro da comunicação** mostra cada byte recebido, os quadros descartados e o resultado das fases.
+
 ## Protocolo (luz e som)
 
 Funciona como uma porta serial (UART): a linha parada vale 0, e cada byte tem 1 bit de início, 8 bits de dados (o menos significativo primeiro) e 2 bits de parada.

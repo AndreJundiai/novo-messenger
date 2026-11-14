@@ -3,7 +3,7 @@ const fs = require('fs');
 const src = fs.readFileSync(__dirname + '/app.js', 'utf8');
 const core = src.split('/* ---------------- Chat')[0];
 const mesh = src.slice(src.indexOf('function varint'), src.indexOf('async function meshDrain'));
-const m = new Function('document', core + mesh + '; return { encodeFrame, FrameDecoder, frameToBits, Uart, pbParse, varint, lenField, fixed32 };')({ getElementById() {} });
+const m = new Function('document', core + mesh + '; return { encodeFrame, FrameDecoder, frameToBits, bytesToBits, toggleBits, Uart, ToggleDetector, TEST_BYTES, pbParse, varint, lenField, fixed32 };')({ getElementById() {} });
 let fails = 0;
 const check = (name, ok) => { console.log((ok ? 'ok   ' : 'FALHA') + ' ' + name); if (!ok) fails++; };
 
@@ -45,5 +45,19 @@ check('som 40ms @8ms', simulate(msg, 40, 8, 4, 3)[0] === msg);
   const d = m.pbParse(p[4][0]);
   check('protobuf texto', d[1][0] === 1 && Buffer.from(d[2][0]).toString() === 'oi pelo LoRa' && (p[2][0] >>> 0) === 0xffffffff);
   check('varint 300', JSON.stringify(m.varint(300)) === '[172,2]');
+}
+// Fase 1: detector de 1010… no ritmo certo; não dispara com ritmo errado
+function feed(bits, T, Trx, sampleMs) {
+  let hit = false; const d = new m.ToggleDetector(Trx, () => { hit = true; });
+  for (let t = 0; t < bits.length * T + 500; t += sampleMs) { const i = Math.floor(t / T); d.push(t, i < bits.length ? bits[i] : 0); }
+  return hit;
+}
+check('fase 1 detecta sinal', feed(m.toggleBits(3000, 150), 150, 150, 33.3));
+check('fase 1 ignora ritmo errado', !feed(m.toggleBits(3000, 400), 400, 150, 33.3));
+// Fase 2: bytes crus chegam iguais
+{
+  const got = []; const u = new m.Uart(150, (b) => got.push(b)); const bits = m.bytesToBits(m.TEST_BYTES);
+  for (let t = 0; t < bits.length * 150 + 500; t += 33.3) { const i = Math.floor((t - 200) / 150); u.push(t, i >= 0 && i < bits.length ? bits[i] : 0); }
+  check('fase 2 bytes', JSON.stringify(got.slice(-7)) === JSON.stringify(m.TEST_BYTES));
 }
 process.exit(fails ? 1 : 0);
