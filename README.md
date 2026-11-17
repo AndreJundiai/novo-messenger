@@ -17,6 +17,15 @@ Além disso:
 - **Histórico local-first (CRDT):** a conversa fica salva no aparelho e pode ser exportada num arquivo `.nmlog`. Importar junta as conversas sem duplicar nada, em qualquer ordem, então dá para sincronizar por Bluetooth ou cabo, sem servidor.
 - **Modo ponte:** um aparelho repassa para os outros canais marcados o que chega por um canal. Por exemplo: ouve por som e manda pelo rádio LoRa, alcançando quilômetros. Cada mensagem tem um limite de repasses (TTL), então não fica em ciclo.
 
+## App Android (fase 1)
+
+A pasta `android/` tem o app nativo com a cara de um mensageiro moderno: lista de conversas, ✓ / ✓✓ / ✓✓ azul, contato adicionado por QR (sem número de telefone) e criptografia de ponta a ponta. Os celulares se conectam direto por Bluetooth e Wi-Fi, sem internet, e o app continua recebendo com a tela desligada.
+
+- **Baixar o APK:** aba **Actions** → "App Android" → última execução → artefato `novo-messenger-apk`.
+- **Compilar na sua máquina:** precisa do Android SDK + NDK, Rust e `cargo install cargo-ndk`. Depois `./android/build-rust.sh` e `cd android && ./gradlew assembleDebug`.
+
+O plano completo, com as próximas fases (malha de celulares, longa distância por LoRa, iPhone), está em [PLANO.md](PLANO.md).
+
 ## Arquitetura
 
 ```
@@ -58,6 +67,9 @@ crates/nm-core/            protocolo e processamento de sinal (biblioteca)
   src/mesh.rs              mensagens de texto do Meshtastic
 crates/nm-wasm/            ponte WebAssembly (C ABI)
 crates/nm-cli/             programa de terminal `nm`
+crates/nm-chat/            conversas: identidade, criptografia, confirmações ✓✓
+crates/nm-ffi/             ligação com Kotlin/Swift (UniFFI)
+android/                   app Android (Kotlin + Jetpack Compose)
 web/                       app (index.html, app.js, nm.js, mic-worklet.js, sw.js)
 web/vendor/jsQR.js         leitor de QR para aparelhos sem leitor nativo (Apache-2.0)
 build.sh                   compila o WebAssembly para web/nm_core.wasm

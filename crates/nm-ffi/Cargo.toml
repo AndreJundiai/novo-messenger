@@ -1,0 +1,16 @@
+[package]
+name = "nm-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ligação do núcleo com Kotlin (Android) e Swift (iOS) via UniFFI"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "nm_ffi"
+
+[dependencies]
+nm-chat = { path = "../nm-chat" }
+nm-core = { path = "../nm-core" }
+uniffi = "0.28.3"
+thiserror = "1.0.69"

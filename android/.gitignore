@@ -1,0 +1,7 @@
+# Gerados por android/build-rust.sh
+app/src/main/jniLibs/
+app/src/main/java/uniffi/
+.gradle/
+build/
+app/build/
+local.properties
