@@ -1,68 +1,73 @@
-//! Quadro de mensagem: `STX (0x02)` + texto UTF-8 + checksum + `ETX (0x03)`.
+//! Quadro com correção de erros, para luz e som.
 //!
-//! O checksum é o XOR dos bytes do texto, forçado para 0x80..=0xFF. Assim ele
-//! nunca se confunde com STX ou ETX, e o texto (sem caracteres de controle)
-//! também não.
+//! `SYNC (02 D5)` + `L` + `!L` + `L bytes de dados` + `paridade Reed-Solomon`.
+//!
+//! O tamanho vai duas vezes (normal e invertido) para rejeitar sincronismos
+//! falsos. A paridade cresce com o tamanho (¼ dos dados, entre 8 e 48 bytes)
+//! e corrige até metade disso em bytes trocados, em qualquer posição.
 
-use crate::MAX_TEXT_BYTES;
+use crate::rs;
 
-pub const STX: u8 = 0x02;
-pub const ETX: u8 = 0x03;
-const MAX_FRAME: usize = 400;
+pub const SYNC: [u8; 2] = [0x02, 0xD5];
+/// Maior bloco de dados: cabeçalho da mensagem + texto máximo.
+pub const MAX_DATA: usize = crate::message::HEADER + crate::MAX_TEXT_BYTES;
 
-pub fn checksum(data: &[u8]) -> u8 {
-    0x80 | (data.iter().fold(0u8, |a, b| a ^ b) & 0x7F)
+/// Bytes de paridade para `len` bytes de dados (a palavra nunca passa de 255).
+pub fn nsym_for(len: usize) -> usize {
+    (len / 4).clamp(8, 48).min(255 - len)
 }
 
-/// Limpa o texto: troca caracteres de controle por espaço, apara as pontas e
-/// corta em [`MAX_TEXT_BYTES`] sem quebrar um caractere UTF-8 ao meio.
-pub fn sanitize(text: &str) -> String {
-    let cleaned: String = text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
-    let trimmed = cleaned.trim();
-    let mut end = trimmed.len().min(MAX_TEXT_BYTES);
-    while !trimmed.is_char_boundary(end) {
-        end -= 1;
-    }
-    trimmed[..end].to_string()
-}
-
-pub fn encode(text: &str) -> Vec<u8> {
-    let text = sanitize(text);
-    let data = text.as_bytes();
-    let mut out = Vec::with_capacity(data.len() + 3);
-    out.push(STX);
+/// Monta o quadro. Dados acima de [`MAX_DATA`] são cortados.
+pub fn encode(data: &[u8]) -> Vec<u8> {
+    let data = &data[..data.len().min(MAX_DATA)];
+    let len = data.len() as u8;
+    let mut out = Vec::with_capacity(4 + data.len() + nsym_for(data.len()));
+    out.extend_from_slice(&SYNC);
+    out.push(len);
+    out.push(!len);
     out.extend_from_slice(data);
-    out.push(checksum(data));
-    out.push(ETX);
+    out.extend(rs::parity(data, nsym_for(data.len())));
     out
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BadFrame {
-    Checksum,
-    InvalidUtf8,
-    TooLong,
+    Length,
+    Uncorrectable,
 }
 
 impl BadFrame {
     pub fn describe(&self) -> &'static str {
         match self {
-            BadFrame::Checksum => "checksum errado",
-            BadFrame::InvalidUtf8 => "texto inválido",
-            BadFrame::TooLong => "quadro longo demais",
+            BadFrame::Length => "tamanho inválido",
+            BadFrame::Uncorrectable => "erros demais para corrigir",
         }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FrameEvent {
-    Text(String),
+    /// Dados íntegros; `fixed` bytes foram corrigidos pelo Reed-Solomon.
+    Data { data: Vec<u8>, fixed: usize },
     Bad(BadFrame),
 }
 
-#[derive(Default)]
+enum State {
+    Hunt,
+    Len,
+    LenCheck(u8),
+    Body { len: usize, total: usize, buf: Vec<u8> },
+}
+
 pub struct FrameDecoder {
-    buf: Option<Vec<u8>>,
+    state: State,
+    prev: u8,
+}
+
+impl Default for FrameDecoder {
+    fn default() -> Self {
+        Self { state: State::Hunt, prev: 0 }
+    }
 }
 
 impl FrameDecoder {
@@ -70,32 +75,55 @@ impl FrameDecoder {
         Self::default()
     }
 
+    /// Volta a procurar o sincronismo (ex.: depois de um silêncio longo).
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
     pub fn push(&mut self, b: u8) -> Option<FrameEvent> {
-        if b == STX {
-            self.buf = Some(Vec::with_capacity(64));
-            return None;
-        }
-        let buf = self.buf.as_mut()?;
-        if b == ETX {
-            let mut buf = self.buf.take()?;
-            let cs = buf.pop()?;
-            if buf.is_empty() {
-                return None;
+        let prev = std::mem::replace(&mut self.prev, b);
+        match &mut self.state {
+            State::Hunt => {
+                if prev == SYNC[0] && b == SYNC[1] {
+                    self.state = State::Len;
+                }
+                None
             }
-            if checksum(&buf) != cs {
-                return Some(FrameEvent::Bad(BadFrame::Checksum));
+            State::Len => {
+                if b == 0 || b as usize > MAX_DATA {
+                    self.state = State::Hunt;
+                    return Some(FrameEvent::Bad(BadFrame::Length));
+                }
+                self.state = State::LenCheck(b);
+                None
             }
-            return Some(match String::from_utf8(buf) {
-                Ok(s) => FrameEvent::Text(s),
-                Err(_) => FrameEvent::Bad(BadFrame::InvalidUtf8),
-            });
+            &mut State::LenCheck(len) => {
+                if b != !len {
+                    self.state = State::Hunt;
+                    return Some(FrameEvent::Bad(BadFrame::Length));
+                }
+                let len = len as usize;
+                let total = len + nsym_for(len);
+                self.state = State::Body { len, total, buf: Vec::with_capacity(total) };
+                None
+            }
+            State::Body { len, total, buf } => {
+                buf.push(b);
+                if buf.len() < *total {
+                    return None;
+                }
+                let (len, mut cw) = (*len, std::mem::take(buf));
+                self.state = State::Hunt;
+                self.prev = 0;
+                Some(match rs::correct(&mut cw, nsym_for(len)) {
+                    Some(fixed) => {
+                        cw.truncate(len);
+                        FrameEvent::Data { data: cw, fixed }
+                    }
+                    None => FrameEvent::Bad(BadFrame::Uncorrectable),
+                })
+            }
         }
-        buf.push(b);
-        if buf.len() > MAX_FRAME {
-            self.buf = None;
-            return Some(FrameEvent::Bad(BadFrame::TooLong));
-        }
-        None
     }
 }
 
@@ -109,39 +137,40 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_unicode() {
-        let f = encode("Olá, corte às 15h ✂️");
-        assert_eq!(decode_all(&f), vec![FrameEvent::Text("Olá, corte às 15h ✂️".into())]);
+    fn roundtrip_with_garbage_before() {
+        let data = "Olá ✂️".as_bytes();
+        let mut v = vec![0xAA, 0x55, 0x02, 0x41];
+        v.extend(encode(data));
+        assert_eq!(decode_all(&v), vec![FrameEvent::Data { data: data.to_vec(), fixed: 0 }]);
     }
 
     #[test]
-    fn checksum_never_collides_with_delimiters() {
-        for x in 0..=255u8 {
-            let c = checksum(&[x]);
-            assert!(c >= 0x80);
+    fn corrects_flipped_bytes_including_sync_free_body() {
+        let data: Vec<u8> = (0..100).collect();
+        let mut f = encode(&data);
+        let nsym = nsym_for(100); // 25 → corrige 12
+        for i in 0..nsym / 2 {
+            f[4 + i * 9] ^= 0x5A;
         }
+        assert_eq!(decode_all(&f), vec![FrameEvent::Data { data, fixed: nsym / 2 }]);
     }
 
     #[test]
-    fn corrupted_frame_is_rejected() {
-        let mut f = encode("teste");
-        f[3] ^= 0x01;
-        assert_eq!(decode_all(&f), vec![FrameEvent::Bad(BadFrame::Checksum)]);
+    fn reports_uncorrectable_and_bad_length() {
+        let data = b"teste curto";
+        let mut f = encode(data);
+        for b in f.iter_mut().skip(4).take(10) {
+            *b ^= 0xFF;
+        }
+        assert_eq!(decode_all(&f), vec![FrameEvent::Bad(BadFrame::Uncorrectable)]);
+        assert_eq!(decode_all(&[0x02, 0xD5, 5, 5]), vec![FrameEvent::Bad(BadFrame::Length)]);
     }
 
     #[test]
-    fn garbage_before_frame_is_ignored() {
-        let mut v = vec![0xAA, 0x55, 0x41];
-        v.extend(encode("ok"));
-        assert_eq!(decode_all(&v), vec![FrameEvent::Text("ok".into())]);
-    }
-
-    #[test]
-    fn sanitize_cuts_on_char_boundary() {
-        let s = "é".repeat(150); // 300 bytes
-        let out = sanitize(&s);
-        assert!(out.len() <= MAX_TEXT_BYTES);
-        assert!(out.chars().all(|c| c == 'é'));
-        assert_eq!(sanitize("a\u{0}b\n"), "a b");
+    fn max_size_fits_one_codeword() {
+        assert_eq!(MAX_DATA + nsym_for(MAX_DATA), 255);
+        let data = vec![0x42; 400];
+        let f = encode(&data);
+        assert_eq!(decode_all(&f), vec![FrameEvent::Data { data: vec![0x42; MAX_DATA], fixed: 0 }]);
     }
 }

@@ -12,14 +12,14 @@
 :root {
   --bg: #f3f6f8; --panel: #ffffff; --fg: #14202b; --muted: #5b6b78;
   --line: #d5dee5; --accent: #0b7a75; --accent-fg: #ffffff;
-  --luz: #c88a00; --som: #7a4cc2; --lora: #1a73c9; --err: #c0392b; --ok: #1f8a4c;
+  --luz: #c88a00; --som: #7a4cc2; --lora: #1a73c9; --qr: #b5426a; --err: #c0392b; --ok: #1f8a4c;
   --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 @media (prefers-color-scheme: dark) {
   :root { --bg: #0f1720; --panel: #17222d; --fg: #e6edf2; --muted: #93a4b2;
     --line: #26343f; --accent: #2bb3a8; --accent-fg: #06201e;
-    --luz: #f0b429; --som: #b18cf0; --lora: #5aa9f0; color-scheme: dark; }
+    --luz: #f0b429; --som: #b18cf0; --lora: #5aa9f0; --qr: #f07fa6; color-scheme: dark; }
 }
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
@@ -37,6 +37,7 @@ header p { margin: 4px 0 0; color: var(--muted); font-size: .9rem; }
 .chan[data-c="luz"] h2 { color: var(--luz); }
 .chan[data-c="som"] h2 { color: var(--som); }
 .chan[data-c="lora"] h2 { color: var(--lora); }
+.chan[data-c="qr"] h2 { color: var(--qr); }
 .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .row label { display: flex; align-items: center; gap: 6px; font-size: .85rem; color: var(--muted); }
 button, select, input[type=number] { font: inherit; }
@@ -78,7 +79,15 @@ video#cam { width: 120px; height: 90px; object-fit: cover; border-radius: 6px; b
 .phase button { font-size: .82rem; padding: 4px 10px; margin-left: auto; }
 .log { font-family: var(--mono); font-size: .74rem; max-height: 220px; overflow-y: auto; display: grid; gap: 2px; margin-top: 8px; }
 .log div { overflow-wrap: anywhere; }
-.log .luz { color: var(--luz); } .log .som { color: var(--som); } .log .lora { color: var(--lora); } .log .err { color: var(--err); } .log .ok { color: var(--ok); }
+.log .luz { color: var(--luz); } .log .som { color: var(--som); } .log .lora { color: var(--lora); } .log .qr { color: var(--qr); } .log .err { color: var(--err); } .log .ok { color: var(--ok); }
+.tools { font-size: .85rem; }
+.filebtn { border: 1px solid var(--line); background: var(--bg); color: var(--fg); padding: 7px 12px; border-radius: 8px; cursor: pointer; font-size: 15px; }
+.filebtn:hover, .filebtn:focus-within { border-color: var(--accent); }
+.filebtn input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+#qrView { position: fixed; inset: 0; z-index: 60; background: #ffffff; color: #000000; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: calc(16px + env(safe-area-inset-top, 0px)) 16px calc(16px + env(safe-area-inset-bottom, 0px)); }
+#qrCanvas { width: min(92vw, 78vh); height: auto; image-rendering: pixelated; }
+#qrView p { margin: 0; font-size: .9rem; text-align: center; }
+#qrView button { background: #222; color: #fff; border-color: #444; }
 .sendvia { display: flex; flex-wrap: wrap; gap: 12px; font-size: .85rem; color: var(--muted); }
 details { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; font-size: .9rem; }
 details summary { cursor: pointer; font-weight: 600; }
@@ -94,7 +103,7 @@ details li { margin-block: 4px; }
 <div class="wrap">
   <header>
     <h1>Novo Messenger</h1>
-    <p>Mensagens sem internet, sem sinal e sem créditos, enviadas por luz, por som e por rádio LoRa.</p>
+    <p>Mensagens sem internet, sem sinal e sem créditos, enviadas por luz, som, QR Code e rádio LoRa.</p>
   </header>
 
   <section class="chans">
@@ -134,6 +143,11 @@ details li { margin-block: 4px; }
         <span class="status" id="loraStatus">desconectado. Precisa de um rádio Meshtastic e do Chrome no Android ou no PC.</span>
       </div>
     </div>
+
+    <div class="chan" data-c="qr">
+      <h2><span class="dot" id="qrDot"></span>QR Code · tela → câmera (a mensagem inteira de uma vez)</h2>
+      <div class="row"><span class="status" id="qrStatus">A leitura acontece junto com "Ouvir pela câmera". Para enviar, marque QR em "Enviar por".</span></div>
+    </div>
   </section>
 
   <section class="phases" aria-labelledby="phTitle">
@@ -150,11 +164,21 @@ details li { margin-block: 4px; }
     <label><input type="checkbox" id="viaLuz" checked> Luz</label>
     <label><input type="checkbox" id="viaSom" checked> Som</label>
     <label><input type="checkbox" id="viaLora"> LoRa</label>
+    <label><input type="checkbox" id="viaQr"> QR</label>
+  </div>
+  <div class="sendvia">
+    <label><input type="checkbox" id="bridge"> Modo ponte: repassar o que chegar por um canal para os outros canais marcados</label>
   </div>
   <form class="compose" id="compose">
     <textarea id="text" maxlength="200" placeholder="Escreva uma mensagem curta…" rows="2"></textarea>
     <button class="primary" id="send" type="submit">Enviar</button>
   </form>
+  <div class="row tools">
+    <button type="button" id="exportBtn">Exportar conversa</button>
+    <label class="filebtn">Importar conversa<input type="file" id="importFile" accept=".nmlog,application/octet-stream"></label>
+    <button type="button" id="clearBtn">Apagar conversa</button>
+    <span class="status" id="toolsStatus"></span>
+  </div>
 
   <details id="logBox" open>
     <summary>Registro da comunicação</summary>
@@ -167,6 +191,10 @@ details li { margin-block: 4px; }
       <li><b>Luz:</b> no receptor toque em "Ouvir pela câmera" e aponte o quadrado amarelo para a tela ou a lanterna do outro celular, a uns 10–30 cm. Envie com o modo "Tela piscando". Cerca de 7 caracteres por segundo com bit de 150 ms.</li>
       <li><b>Som:</b> deixe os celulares a menos de 1–2 m, em lugar silencioso, e o volume alto. A opção quase inaudível depende do alto-falante e do microfone.</li>
       <li><b>LoRa:</b> conecte um rádio com firmware Meshtastic (Heltec, T-Beam, RAK etc.). As mensagens vão para o canal principal e chegam a qualquer rádio Meshtastic ao alcance.</li>
+      <li><b>QR Code:</b> quem envia mostra o QR na tela; quem recebe aponta a câmera ("Ouvir pela câmera"). A mensagem passa de uma vez, em vez de bit a bit.</li>
+      <li><b>Correção de erros:</b> luz, som e QR levam paridade Reed-Solomon. Bytes trocados são consertados e aparecem no registro.</li>
+      <li><b>Modo ponte:</b> um aparelho com rádio LoRa pode repassar para o rádio o que ouviu por som ou luz, e o contrário. Cada mensagem tem um limite de repasses, então não fica em ciclo.</li>
+      <li><b>Exportar e importar:</b> o arquivo .nmlog pode ser enviado por Bluetooth ou cabo, sem internet. Importar junta as conversas sem duplicar nada.</li>
       <li><b>Todos ao mesmo tempo:</b> marque mais de um canal. A mensagem sai por todos de uma vez, e as cópias repetidas são ignoradas no receptor.</li>
       <li><b>Fora do navegador:</b> Bluetooth direto entre celulares, Wi-Fi Direct e infravermelho precisam de app nativo. Para isso use o Briar, que é gratuito e de código aberto.</li>
       <li><b>Offline:</b> abra esta página uma vez com internet. Depois ela fica salva e abre sem rede (use "Adicionar à tela inicial").</li>
@@ -175,7 +203,9 @@ details li { margin-block: 4px; }
 </div>
 
 <div id="flash" hidden><div class="prog" id="flashProg"></div><button id="flashStop">Parar</button></div>
+<div id="qrView" hidden><canvas id="qrCanvas"></canvas><p id="qrCaption"></p><button id="qrClose" type="button">Fechar</button></div>
 
+<script src="vendor/jsQR.js"></script>
 <script src="nm.js"></script>
 <script src="app.js"></script>
 </body>

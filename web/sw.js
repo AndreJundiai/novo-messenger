@@ -1,6 +1,6 @@
 // Guarda o app no aparelho para abrir sem internet
-const CACHE = 'novo-messenger-v3';
-const FILES = ['./', './index.html', './app.js', './manifest.webmanifest', './icon.svg', './nm.js', './nm_core.wasm', './mic-worklet.js'];
+const CACHE = 'novo-messenger-v4';
+const FILES = ['./', './index.html', './app.js', './manifest.webmanifest', './icon.svg', './nm.js', './nm_core.wasm', './mic-worklet.js', './vendor/jsQR.js'];
 self.addEventListener('install', (e) => { e.waitUntil(caches.open(CACHE).then((c) => c.addAll(FILES))); self.skipWaiting(); });
 self.addEventListener('activate', (e) => {
   e.waitUntil(caches.keys().then((ks) => Promise.all(ks.filter((k) => k !== CACHE).map((k) => caches.delete(k)))));

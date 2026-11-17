@@ -54,6 +54,16 @@ impl Uart {
         Self { bit_ms, state: State::Idle, prev: 0, prev_t: None, edge: 0.0, bit: 0, byte: 0 }
     }
 
+    /// Nível da amostra mais próxima de `center`: a anterior ou a atual (`t`, `l`).
+    /// Com poucas amostras por bit (câmera), escolher só a primeira depois do
+    /// centro pode cair no bit seguinte.
+    fn nearest(&self, center: f64, t: f64, l: u8) -> u8 {
+        match self.prev_t {
+            Some(pt) if center - pt < t - center => self.prev,
+            _ => l,
+        }
+    }
+
     /// Recebe uma amostra (tempo em ms, nível 0/1). Devolve um byte quando completo.
     pub fn push(&mut self, t: f64, level: u8) -> Option<u8> {
         let l = (level != 0) as u8;
@@ -70,7 +80,8 @@ impl Uart {
             }
             State::Data => {
                 while self.bit < 8 && t >= self.edge + (self.bit as f64 + 1.5) * t_bit {
-                    self.byte |= l << self.bit;
+                    let center = self.edge + (self.bit as f64 + 1.5) * t_bit;
+                    self.byte |= self.nearest(center, t, l) << self.bit;
                     self.bit += 1;
                 }
                 if self.bit == 8 {
@@ -80,7 +91,7 @@ impl Uart {
             State::Stop => {}
         }
         if self.state == State::Stop && t >= self.edge + 9.5 * t_bit {
-            if l == 0 {
+            if self.nearest(self.edge + 9.5 * t_bit, t, l) == 0 {
                 out = Some(self.byte);
             }
             self.state = State::Idle;
@@ -170,6 +181,15 @@ pub(crate) mod tests {
         for seed in 1..6 {
             let got = roundtrip(&data, 150.0, 33.3, 15.0, seed);
             assert!(got.ends_with(&data), "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn no_byte_errors_at_three_samples_per_bit() {
+        let data: Vec<u8> = (0..=255).collect();
+        for seed in 1..40 {
+            let got = roundtrip(&data, 100.0, 33.3, 10.0, seed);
+            assert_eq!(&got[got.len() - 256..], &data[..], "seed {seed}");
         }
     }
 

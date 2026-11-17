@@ -6,6 +6,7 @@
 //! 3 quadro de teste íntegro · 4 mensagem livre.
 
 use crate::frame::{BadFrame, FrameDecoder, FrameEvent};
+use crate::message::Message;
 use crate::fsk::{FskConfig, FskDemod, FskSample};
 use crate::light::LightDetector;
 use crate::uart::{ToggleDetector, Uart};
@@ -17,7 +18,9 @@ pub enum Event {
     Byte(u8),
     /// Fase (1 a 4) que acabou de passar.
     Phase(u8),
-    Message(String),
+    Message(Message),
+    /// Bytes corrigidos pelo Reed-Solomon no último quadro.
+    Fixed(usize),
     Bad(BadFrame),
 }
 
@@ -44,6 +47,8 @@ pub struct Receiver {
     frames: FrameDecoder,
     recent: VecDeque<u8>,
     muted: bool,
+    bit_ms: f64,
+    last_byte_t: f64,
     events: Vec<Event>,
     scope: Vec<(f64, f32, u8)>,
     status: Status,
@@ -62,6 +67,8 @@ impl Receiver {
             frames: FrameDecoder::new(),
             recent: VecDeque::with_capacity(TEST_BYTES.len() + 1),
             muted: false,
+            bit_ms,
+            last_byte_t: f64::NEG_INFINITY,
             events: Vec::new(),
             scope: Vec::new(),
             status: Status::default(),
@@ -116,6 +123,11 @@ impl Receiver {
             self.events.push(Event::Phase(1));
         }
         let Some(byte) = self.uart.push(t, level) else { return };
+        // Silêncio longo no meio de um quadro: um byte se perdeu, recomeça.
+        if t - self.last_byte_t > self.bit_ms * 40.0 {
+            self.frames.reset();
+        }
+        self.last_byte_t = t;
         self.events.push(Event::Byte(byte));
         if self.recent.len() == TEST_BYTES.len() {
             self.recent.pop_front();
@@ -125,10 +137,18 @@ impl Receiver {
             self.events.push(Event::Phase(2));
         }
         match self.frames.push(byte) {
-            Some(FrameEvent::Text(t)) if t == TEST_TEXT => self.events.push(Event::Phase(3)),
-            Some(FrameEvent::Text(t)) => {
-                self.events.push(Event::Message(t));
-                self.events.push(Event::Phase(4));
+            Some(FrameEvent::Data { data, fixed }) => {
+                if fixed > 0 {
+                    self.events.push(Event::Fixed(fixed));
+                }
+                match Message::from_bytes(&data) {
+                    Some(m) if m.id == 0 && m.text == TEST_TEXT => self.events.push(Event::Phase(3)),
+                    Some(m) => {
+                        self.events.push(Event::Message(m));
+                        self.events.push(Event::Phase(4));
+                    }
+                    None => self.events.push(Event::Bad(BadFrame::Uncorrectable)),
+                }
             }
             Some(FrameEvent::Bad(b)) => self.events.push(Event::Bad(b)),
             None => {}
@@ -177,11 +197,12 @@ impl Receiver {
             match e {
                 Event::Byte(b) => o.push_str(&format!("{{\"k\":\"byte\",\"v\":{b}}}")),
                 Event::Phase(p) => o.push_str(&format!("{{\"k\":\"phase\",\"v\":{p}}}")),
-                Event::Message(t) => {
+                Event::Message(m) => {
                     o.push_str("{\"k\":\"msg\",\"v\":");
-                    json::string(&mut o, t);
+                    m.write_json(&mut o);
                     o.push('}');
                 }
+                Event::Fixed(n) => o.push_str(&format!("{{\"k\":\"fixed\",\"v\":{n}}}")),
                 Event::Bad(b) => {
                     o.push_str("{\"k\":\"bad\",\"v\":");
                     json::string(&mut o, b.describe());
@@ -201,18 +222,23 @@ mod tests {
     use super::*;
     use crate::fsk::synth;
     use crate::uart::tests::sample;
-    use crate::{tx_bits, Payload};
+    use crate::{test_message, tx_bits, Payload};
 
     fn phases(events: &[Event]) -> Vec<u8> {
         events.iter().filter_map(|e| if let Event::Phase(p) = e { Some(*p) } else { None }).collect()
     }
 
     /// Simula a sessão inteira: as 4 fases em sequência, com silêncio entre elas.
+    fn hello() -> Message {
+        Message::new(99, 4, 1, "Olá ✂️")
+    }
+
     fn all_phases(bit_ms: f64) -> Vec<u8> {
         let gap = vec![0u8; (1000.0 / bit_ms) as usize];
+        let (t, h) = (test_message(), hello());
         let mut bits = gap.clone();
-        for (p, text) in [(Payload::Toggle, ""), (Payload::TestBytes, ""), (Payload::Text, TEST_TEXT), (Payload::Text, "Olá ✂️")] {
-            bits.extend(tx_bits(p, text, bit_ms));
+        for p in [Payload::Toggle, Payload::TestBytes, Payload::Message(&t), Payload::Message(&h)] {
+            bits.extend(tx_bits(p, bit_ms));
             bits.extend(&gap);
         }
         bits
@@ -226,7 +252,7 @@ mod tests {
         }
         let ev = rx.take_events();
         assert_eq!(phases(&ev), vec![1, 2, 3, 4]);
-        assert!(ev.contains(&Event::Message("Olá ✂️".into())));
+        assert!(ev.contains(&Event::Message(hello())));
     }
 
     #[test]
@@ -238,6 +264,36 @@ mod tests {
             rx.push_pcm(c);
         }
         assert_eq!(phases(&rx.take_events()), vec![1, 2, 3, 4]);
+    }
+
+    fn send_with_flips(flips: &[usize]) -> Vec<Event> {
+        let h = hello();
+        let mut bits = vec![0u8; 10];
+        bits.extend(tx_bits(Payload::Message(&h), 100.0));
+        bits.extend([0u8; 10]);
+        // Troca o bit de dados nº 3 de cada byte indicado do quadro.
+        for &byte in flips {
+            bits[10 + 20 + byte * 11 + 3] ^= 1;
+        }
+        let mut rx = Receiver::light(100.0);
+        for (t, l) in sample(&bits, 100.0, 33.3, 8.0, 9) {
+            rx.push_luma(t, if l == 1 { 200.0 } else { 30.0 });
+        }
+        rx.take_events()
+    }
+
+    #[test]
+    fn clean_signal_needs_no_correction() {
+        let ev = send_with_flips(&[]);
+        assert!(!ev.iter().any(|e| matches!(e, Event::Fixed(_))), "{ev:?}");
+        assert!(ev.contains(&Event::Message(hello())));
+    }
+
+    #[test]
+    fn corrupted_bits_are_corrected_end_to_end() {
+        let ev = send_with_flips(&[8, 12, 17]);
+        assert!(ev.contains(&Event::Fixed(3)), "{ev:?}");
+        assert!(ev.contains(&Event::Message(hello())));
     }
 
     #[test]
@@ -253,11 +309,11 @@ mod tests {
     #[test]
     fn json_output_is_well_formed() {
         let mut rx = Receiver::light(100.0);
-        rx.events.push(Event::Message("diz \"oi\"".into()));
+        rx.events.push(Event::Message(Message::new(1, 2, 0, "diz \"oi\"")));
         rx.push_luma(0.0, 10.0);
         let j = rx.drain_json();
         assert!(j.starts_with("{\"st\":{\"l\":0"));
-        assert!(j.contains(r#"{"k":"msg","v":"diz \"oi\""}"#));
+        assert!(j.contains(r#"{"k":"msg","v":{"id":1,"lamport":2,"ttl":0,"text":"diz \"oi\""}}"#));
         assert!(j.ends_with("]}"));
     }
 }

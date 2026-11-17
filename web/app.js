@@ -2,57 +2,55 @@
 /*
  * Novo Messenger — interface.
  *
- * Todo o protocolo e o processamento de sinal ficam no núcleo Rust
- * (nm_core.wasm, carregado por nm.js). Aqui só ficam a tela, a câmera,
- * o microfone, o alto-falante e o Bluetooth.
+ * Todo o protocolo, a correção de erros, o QR Code e o histórico (CRDT)
+ * ficam no núcleo Rust (nm_core.wasm, carregado por nm.js). Aqui só ficam a
+ * tela, a câmera, o microfone, o alto-falante e o Bluetooth.
  */
 
 const $ = (id) => document.getElementById(id);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const hex = (b) => b.toString(16).padStart(2, '0').toUpperCase();
-const CH_NAME = { luz: 'Luz', som: 'Som', lora: 'LoRa' };
+const randId = () => (crypto.getRandomValues(new Uint32Array(1))[0] || 1) >>> 0;
+const CHANNELS = ['luz', 'som', 'lora', 'qr'];
+const CH_NAME = { luz: 'Luz', som: 'Som', lora: 'LoRa', qr: 'QR' };
+// Bits de "por onde chegou", iguais aos de nm-core::store::via
+const VIA = { me: 1, luz: 2, som: 4, lora: 8, qr: 16, file: 32 };
+const VIA_NAME = [[VIA.me, 'você'], [VIA.luz, 'Luz'], [VIA.som, 'Som'], [VIA.lora, 'LoRa'], [VIA.qr, 'QR'], [VIA.file, 'arquivo']];
+const TTL = 3; // quantas pontes uma mensagem nova pode atravessar
 let NM = null;
 
-/* ---------------- Chat ---------------- */
-const seen = new Map(); // texto -> {at, msg}: junta cópias que chegam por vários canais
-let history = [];
-try { history = JSON.parse(localStorage.getItem('nm-history') || '[]'); } catch (_) {}
-
+/* ---------------- Conversa (histórico no núcleo, CRDT) ---------------- */
+function persist() {
+  try { localStorage.setItem('nm-store', NM.storeSave()); } catch (_) {}
+}
 function render() {
   const chat = $('chat');
   chat.querySelectorAll('.msg').forEach((n) => n.remove());
-  $('empty').hidden = history.length > 0;
-  for (const m of history) {
+  const list = NM ? NM.storeList() : [];
+  $('empty').hidden = list.length > 0;
+  for (const m of list) {
     const d = document.createElement('div');
-    d.className = 'msg' + (m.me ? ' me' : '');
+    d.className = 'msg' + (m.via & VIA.me ? ' me' : '');
     d.textContent = m.text;
     const meta = document.createElement('span');
     meta.className = 'meta';
-    meta.textContent = `${m.me ? 'você' : 'recebida'} · ${m.via.join(' + ')} · ${new Date(m.at).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}`;
+    const via = VIA_NAME.filter(([bit]) => m.via & bit && bit !== VIA.me).map(([, n]) => n);
+    const when = new Date(m.at).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+    meta.textContent = `${m.via & VIA.me ? 'você' : 'recebida'}${via.length ? ' · ' + via.join(' + ') : ''} · ${when}`;
     d.appendChild(meta);
     chat.appendChild(d);
   }
   chat.scrollTop = chat.scrollHeight;
 }
-function save() {
-  history = history.slice(-200);
-  try { localStorage.setItem('nm-history', JSON.stringify(history)); } catch (_) {}
-}
-function addMessage(text, via, me) {
-  if (me) {
-    history.push({ text, via, me: true, at: Date.now() });
-  } else {
-    const last = seen.get(text);
-    if (last && Date.now() - last.at < 60000) {
-      if (!last.msg.via.includes(via)) { last.msg.via.push(via); save(); render(); }
-      return;
-    }
-    const msg = { text, via: [via], me: false, at: Date.now() };
-    seen.set(text, { at: Date.now(), msg });
-    history.push(msg);
-    if (navigator.vibrate) navigator.vibrate(120);
-  }
-  save(); render();
+
+/* Mensagem com cabeçalho chegou por luz, som ou QR */
+function onMessage(ch, m) {
+  const isNew = NM.storeReceive(m, VIA[ch], Date.now());
+  persist(); render();
+  if (!isNew) { log(ch, `cópia de mensagem já recebida: "${m.text}"`); return; }
+  log(ch, `mensagem recebida: "${m.text}"`, 'ok');
+  if (navigator.vibrate) navigator.vibrate(120);
+  bridge(ch, m);
 }
 
 /* ---------------- Registro ---------------- */
@@ -70,12 +68,12 @@ function log(ch, text, kind = '') {
 const PHASES = [
   { title: 'Sinal', desc: 'O emissor pisca ou apita 1-0-1-0 por 4 s. O receptor deve ver ondas regulares no gráfico.', btn: 'Enviar sinal de teste', kind: 'toggle' },
   { title: 'Bits e bytes', desc: 'Envia 7 bytes fixos (55 AA 0F F0 41 42 43). O receptor confere byte a byte no registro.', btn: 'Enviar bytes de teste', kind: 'bytes' },
-  { title: 'Mensagem de teste', desc: 'Envia o quadro "TESTE-OK 123" com checksum. Confere se a mensagem inteira chega sem erro.', btn: 'Enviar mensagem de teste', kind: 'text' },
+  { title: 'Mensagem de teste', desc: 'Envia "TESTE-OK 123" com correção de erros. Confere se chega inteira (bytes consertados aparecem no registro).', btn: 'Enviar mensagem de teste', kind: 'test' },
   { title: 'Conversa', desc: 'Escreva uma mensagem de verdade lá embaixo e envie. Passa quando chegar ao outro aparelho.', btn: null },
 ];
 let phaseState;
 function resetPhases() {
-  phaseState = { luz: ['', '', '', ''], som: ['', '', '', ''], lora: [mesh ? 'ok' : '', 'na', '', ''] };
+  phaseState = { luz: ['', '', '', ''], som: ['', '', '', ''], lora: [mesh ? 'ok' : '', 'na', '', ''], qr: ['na', 'na', '', ''] };
   renderPhases();
 }
 function markPhase(ch, i) {
@@ -90,13 +88,13 @@ function renderPhases() {
   list.textContent = '';
   PHASES.forEach((p, i) => {
     const el = document.createElement('div');
-    el.className = 'phase' + (['luz', 'som', 'lora'].some((c) => phaseState[c][i] === 'ok') ? ' done' : '');
+    el.className = 'phase' + (CHANNELS.some((c) => phaseState[c][i] === 'ok') ? ' done' : '');
     el.innerHTML = '<span class="num"></span><b></b><span class="d"></span><div class="chips"></div>';
     el.querySelector('.num').textContent = i + 1;
     el.querySelector('b').textContent = p.title;
     el.querySelector('.d').textContent = p.desc;
     const chips = el.querySelector('.chips');
-    for (const c of ['luz', 'som', 'lora']) {
+    for (const c of CHANNELS) {
       const s = phaseState[c][i];
       const chip = document.createElement('span');
       chip.className = 'chip ' + s;
@@ -106,7 +104,7 @@ function renderPhases() {
     if (p.btn) {
       const b = document.createElement('button');
       b.type = 'button'; b.textContent = p.btn; b.disabled = !NM;
-      b.onclick = () => runTest(i, b);
+      b.onclick = () => runTest(i);
       chips.appendChild(b);
     }
     list.appendChild(el);
@@ -150,7 +148,7 @@ function makeScope(canvas) {
 }
 const scopes = { luz: makeScope($('luzScope')), som: makeScope($('somScope')) };
 
-/* Aplica o que o núcleo devolveu: gráfico, bytes, fases, mensagens */
+/* Aplica o que o núcleo devolveu: gráfico, bytes, correções, fases, mensagens */
 function makeSink(ch, byteMs) {
   let line = [], timer = null;
   const flush = () => { if (line.length) log(ch, 'bytes: ' + line.map(hex).join(' ')); line = []; };
@@ -161,34 +159,35 @@ function makeSink(ch, byteMs) {
         line.push(e.v);
         clearTimeout(timer); timer = setTimeout(flush, byteMs * 3);
         if (line.length >= 16) flush();
+      } else if (e.k === 'fixed') {
+        flush(); log(ch, `correção de erros: ${e.v} byte(s) consertado(s)`, 'ok');
       } else if (e.k === 'phase') {
         flush();
         if (e.v === 3) log(ch, `mensagem de teste recebida: "${NM.TEST_TEXT}"`, 'ok');
         markPhase(ch, e.v - 1);
       } else if (e.k === 'msg') {
-        flush();
-        log(ch, `mensagem recebida: "${e.v}"`, 'ok');
-        addMessage(e.v, CH_NAME[ch], false);
+        flush(); onMessage(ch, e.v);
       } else if (e.k === 'bad') {
-        flush();
-        log(ch, 'quadro descartado: ' + e.v, 'err');
+        flush(); log(ch, 'quadro descartado: ' + e.v, 'err');
       }
     }
     return d.st;
   };
 }
 
-const receivers = new Set(); // receptores ativos, silenciados enquanto este aparelho transmite
-const muteAll = (m) => receivers.forEach((r) => r.setMuted(m));
+// Receptor ativo por canal. Ao transmitir por luz ou som, só o receptor do
+// mesmo canal é silenciado (eco do próprio aparelho); os outros seguem ouvindo.
+const receivers = { luz: null, som: null };
+const muteFor = (chans, m) => chans.forEach((c) => receivers[c]?.setMuted(m));
 
-/* ---------------- LUZ ---------------- */
+/* ---------------- LUZ (e leitura de QR, pela mesma câmera) ---------------- */
 let flashAbort = false;
 $('flashStop').onclick = () => { flashAbort = true; };
 const luzT = () => +$('luzT').value || 150;
 
-async function sendLight(kind, text) {
+async function sendLight(kind, msg) {
   const T = luzT();
-  const bits = NM.txBits(kind, text, T);
+  const bits = NM.txBits(kind, msg, T);
   const mode = $('luzMode').value;
   let setLevel, cleanup;
   if (mode === 'torch') {
@@ -224,21 +223,60 @@ async function sendLight(kind, text) {
   log('luz', 'envio concluído');
 }
 
+/* Leitor de QR: nativo (BarcodeDetector) quando existe, senão jsQR */
+function makeQrReader() {
+  let detector = null;
+  try { if ('BarcodeDetector' in window) detector = new BarcodeDetector({ formats: ['qr_code'] }); } catch (_) {}
+  const c = document.createElement('canvas');
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  let busy = false, last = '', lastAt = 0;
+  const handle = (raw) => {
+    if (!raw || (raw === last && Date.now() - lastAt < 10000)) return;
+    last = raw; lastAt = Date.now();
+    const m = NM.qrParse(raw);
+    if (!m) { log('qr', 'QR lido, mas não é do Novo Messenger'); return; }
+    if (m.fixed) log('qr', `correção de erros: ${m.fixed} byte(s) consertado(s)`, 'ok');
+    if (m.test) { log('qr', `mensagem de teste recebida: "${m.text}"`, 'ok'); markPhase('qr', 2); return; }
+    onMessage('qr', m);
+    markPhase('qr', 3);
+  };
+  return async (video) => {
+    if (busy || !video.videoWidth) return;
+    busy = true;
+    try {
+      if (detector) {
+        const codes = await detector.detect(video);
+        for (const code of codes) handle(code.rawValue);
+      } else if (window.jsQR) {
+        const scale = Math.min(1, 480 / video.videoWidth);
+        c.width = Math.round(video.videoWidth * scale); c.height = Math.round(video.videoHeight * scale);
+        ctx.drawImage(video, 0, 0, c.width, c.height);
+        const img = ctx.getImageData(0, 0, c.width, c.height);
+        const code = window.jsQR(img.data, c.width, c.height, { inversionAttempts: 'dontInvert' });
+        if (code) handle(code.data);
+      }
+    } catch (_) { /* quadro ruim: tenta no próximo */ } finally { busy = false; }
+  };
+}
+
 let luz = null;
 $('luzRx').onclick = async () => {
   if (luz) { stopLuz(); return; }
   let stream;
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment', frameRate: { ideal: 60 }, width: { ideal: 320 } } });
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment', frameRate: { ideal: 60 }, width: { ideal: 640 } } });
   } catch (e) { $('luzStatus').textContent = 'câmera negada: ' + e.message; return; }
   const v = $('cam'); v.srcObject = stream; await v.play();
   const T = luzT();
   const rx = NM.lightReceiver(T);
-  receivers.add(rx);
+  receivers.luz = rx;
   luz = { stream, rx };
-  $('camWrap').hidden = false; $('luzDot').classList.add('on'); $('luzRx').textContent = 'Parar câmera';
-  log('luz', `escutando pela câmera (bit ${T} ms)`);
+  $('camWrap').hidden = false; $('luzDot').classList.add('on'); $('qrDot').classList.add('on');
+  $('luzRx').textContent = 'Parar câmera';
+  log('luz', `escutando pela câmera (bit ${T} ms). QR Codes também são lidos.`);
   const sink = makeSink('luz', T * 11);
+  const readQr = makeQrReader();
+  let lastQr = 0;
   scopes.luz.start();
   const c = document.createElement('canvas'); c.width = c.height = 24;
   const ctx = c.getContext('2d', { willReadFrequently: true });
@@ -256,6 +294,7 @@ $('luzRx').onclick = async () => {
       $('luzMeter').style.width = (y / 255 * 100) + '%';
       $('luzMeter').classList.toggle('hi', st.l === 1);
       $('luzStatus').textContent = `brilho ${st.a.toFixed(0)} · contraste ${st.b.toFixed(0)}${st.sig ? ' ✓' : ' (aproxime da luz)'}`;
+      if (performance.now() - lastQr > 250) { lastQr = performance.now(); readQr(v); }
     }
     if (v.requestVideoFrameCallback) v.requestVideoFrameCallback(tick); else requestAnimationFrame(tick);
   };
@@ -263,10 +302,41 @@ $('luzRx').onclick = async () => {
 };
 function stopLuz() {
   luz.stream.getTracks().forEach((t) => t.stop());
-  receivers.delete(luz.rx); luz.rx.free(); luz = null;
-  $('camWrap').hidden = true; $('luzDot').classList.remove('on'); $('luzRx').textContent = 'Ouvir pela câmera';
+  receivers.luz = null; luz.rx.free(); luz = null;
+  $('camWrap').hidden = true; $('luzDot').classList.remove('on'); $('qrDot').classList.remove('on');
+  $('luzRx').textContent = 'Ouvir pela câmera';
   $('luzStatus').textContent = 'parado'; $('luzMeter').style.width = '0';
   scopes.luz.stop(); log('luz', 'câmera parada');
+}
+
+/* ---------------- QR (envio) ---------------- */
+let qrClose = null;
+$('qrClose').onclick = () => qrClose?.();
+
+async function sendQr(kind, msg) {
+  const q = NM.qr(kind, msg);
+  if (!q) throw new Error('mensagem grande demais para um QR Code');
+  const quiet = 4, n = q.size + quiet * 2, scale = Math.max(4, Math.floor(1024 / n));
+  const cv = $('qrCanvas');
+  cv.width = cv.height = n * scale;
+  const ctx = cv.getContext('2d');
+  ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.fillStyle = '#000000';
+  for (let y = 0; y < q.size; y++) {
+    for (let x = 0; x < q.size; x++) {
+      if (q.modules[y * q.size + x]) ctx.fillRect((x + quiet) * scale, (y + quiet) * scale, scale, scale);
+    }
+  }
+  $('qrCaption').textContent = (kind === 'test' ? 'Mensagem de teste' : `"${msg.text}"`) + ' · aponte a câmera do outro aparelho. Fecha sozinho em 20 s.';
+  $('qrView').hidden = false;
+  log('qr', `mostrando QR (${q.size}×${q.size} módulos)`);
+  await new Promise((resolve) => {
+    const timer = setTimeout(resolve, 20000);
+    qrClose = () => { clearTimeout(timer); resolve(); };
+  });
+  qrClose = null;
+  $('qrView').hidden = true;
+  log('qr', 'QR fechado');
 }
 
 /* ---------------- SOM ---------------- */
@@ -279,10 +349,10 @@ function audio() {
 const freqs = () => $('somF').value.split(',').map(Number);
 const somT = () => +$('somT').value || 80;
 
-async function sendSound(kind, text) {
+async function sendSound(kind, msg) {
   const ctx = audio();
   const [f0, f1] = freqs();
-  const pcm = NM.txSynth(kind, text, ctx.sampleRate, f0, f1, somT(), 0.8);
+  const pcm = NM.txSynth(kind, msg, ctx.sampleRate, f0, f1, somT(), 0.8);
   const buf = ctx.createBuffer(1, pcm.length, ctx.sampleRate);
   buf.copyToChannel(pcm, 0);
   const src = ctx.createBufferSource();
@@ -306,7 +376,7 @@ $('somRx').onclick = async () => {
   const T = somT();
   const [f0, f1] = freqs();
   const rx = NM.soundReceiver(ctx.sampleRate, f0, f1, T);
-  receivers.add(rx);
+  receivers.som = rx;
   const src = ctx.createMediaStreamSource(stream);
   const tap = new AudioWorkletNode(ctx, 'nm-tap');
   const mute = ctx.createGain(); mute.gain.value = 0;
@@ -328,7 +398,7 @@ $('somRx').onclick = async () => {
 function stopSom() {
   som.tap.port.onmessage = null; som.src.disconnect(); som.tap.disconnect();
   som.stream.getTracks().forEach((t) => t.stop());
-  receivers.delete(som.rx); som.rx.free(); som = null;
+  receivers.som = null; som.rx.free(); som = null;
   $('somDot').classList.remove('on'); $('somRx').textContent = 'Ouvir pelo microfone';
   $('somStatus').textContent = 'parado'; $('somMeter').style.width = '0';
   scopes.som.stop(); log('som', 'microfone parado');
@@ -341,11 +411,18 @@ async function meshDrain() {
   for (let n = 0; n < 500 && mesh; n++) {
     const dv = await mesh.from.readValue();
     if (!dv.byteLength) break;
-    const m = NM.meshDecode(new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength));
-    if (!m) continue;
-    const from = '!' + (m.from >>> 0).toString(16);
-    if (m.text === NM.TEST_TEXT) { log('lora', `mensagem de teste de ${from}`, 'ok'); markPhase('lora', 2); }
-    else { log('lora', `mensagem de ${from}: "${m.text}"`, 'ok'); addMessage(m.text, 'LoRa', false); markPhase('lora', 3); }
+    const r = NM.meshDecode(new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength));
+    if (!r) continue;
+    const from = '!' + (r.from >>> 0).toString(16);
+    if (r.text === NM.TEST_TEXT) { log('lora', `mensagem de teste de ${from}`, 'ok'); markPhase('lora', 2); continue; }
+    // O rádio leva texto puro (compatível com outros apps Meshtastic): o núcleo cria a mensagem.
+    const m = NM.storeReceiveText(r.text, VIA.lora, randId(), Date.now());
+    persist(); render();
+    if (!m) { log('lora', `cópia de mensagem já recebida: "${r.text}"`); continue; }
+    log('lora', `mensagem de ${from}: "${r.text}"`, 'ok');
+    if (navigator.vibrate) navigator.vibrate(120);
+    markPhase('lora', 3);
+    bridge('lora', m);
   }
 }
 
@@ -363,7 +440,7 @@ $('loraConn').onclick = async () => {
       log('lora', 'rádio desconectado', 'err');
     });
     // abre a sessão e descarta a configuração que o rádio envia em seguida
-    await mesh.to.writeValue(NM.meshWantConfig((Math.random() * 1e9) >>> 0));
+    await mesh.to.writeValue(NM.meshWantConfig(randId()));
     await meshDrain();
     await mesh.num.startNotifications();
     mesh.num.addEventListener('characteristicvaluechanged', async () => {
@@ -380,69 +457,131 @@ $('loraConn').onclick = async () => {
 
 async function sendLora(text) {
   if (!mesh) throw new Error('rádio LoRa não conectado');
-  await mesh.to.writeValue(NM.meshText(text, (Math.random() * 0xffffffff) >>> 0));
+  await mesh.to.writeValue(NM.meshText(text, randId()));
   log('lora', `enviado ao rádio: "${text}"`);
 }
 
-/* ---------------- Envio por todos os canais ---------------- */
-function selectedChannels() {
-  return ['luz', 'som', 'lora'].filter((c) => $('via' + CH_NAME[c]).checked);
+/* ---------------- Transmissão (uma por vez, em fila) ---------------- */
+const VIA_BOX = { luz: 'viaLuz', som: 'viaSom', lora: 'viaLora', qr: 'viaQr' };
+const selectedChannels = () => CHANNELS.filter((c) => $(VIA_BOX[c]).checked);
+let queue = Promise.resolve();
+let pending = 0;
+function setSending(on) {
+  $('send').disabled = on || !NM;
+  document.querySelectorAll('#phaseList button').forEach((b) => { b.disabled = on || !NM; });
 }
 
-// kind: 'toggle' (fase 1), 'bytes' (fase 2), 'text' (fases 3 e 4)
-async function transmit(kind, text) {
-  const chans = selectedChannels();
-  if (!chans.length) { log(null, 'marque pelo menos um canal em "Enviar por"', 'err'); return []; }
-  const jobs = chans.map((ch) => {
-    if (ch === 'lora') {
-      if (kind !== 'text') { log('lora', 'esta fase não se aplica ao rádio (ele já confere os dados)'); return Promise.resolve(); }
-      return sendLora(text);
-    }
-    return ch === 'luz' ? sendLight(kind, text) : sendSound(kind, text);
-  });
-  muteAll(true);
-  const results = await Promise.allSettled(jobs);
-  muteAll(false);
-  const ok = [];
-  results.forEach((r, i) => {
-    if (r.status === 'rejected') log(chans[i], 'erro ao enviar: ' + (r.reason?.message || r.reason), 'err');
-    else ok.push(CH_NAME[chans[i]]);
-  });
-  return ok;
+// kind: 'toggle' (fase 1), 'bytes' (fase 2), 'test' (fase 3), 'msg' (mensagem)
+function transmit(kind, msg, chans) {
+  pending++; setSending(true);
+  const run = async () => {
+    if (!chans.length) { log(null, 'marque pelo menos um canal em "Enviar por"', 'err'); return []; }
+    const jobs = chans.map((ch) => {
+      if (ch === 'lora') {
+        if (kind === 'toggle' || kind === 'bytes') { log('lora', 'esta fase não se aplica ao rádio (ele já confere os dados)'); return Promise.resolve(); }
+        return sendLora(kind === 'test' ? NM.TEST_TEXT : msg.text);
+      }
+      if (ch === 'qr') {
+        if (kind === 'toggle' || kind === 'bytes') { log('qr', 'esta fase não se aplica ao QR (ele já confere os dados)'); return Promise.resolve(); }
+        return sendQr(kind, msg);
+      }
+      return ch === 'luz' ? sendLight(kind, msg) : sendSound(kind, msg);
+    });
+    muteFor(chans, true);
+    const results = await Promise.allSettled(jobs);
+    muteFor(chans, false);
+    const ok = [];
+    results.forEach((r, i) => {
+      if (r.status === 'rejected') log(chans[i], 'erro ao enviar: ' + (r.reason?.message || r.reason), 'err');
+      else ok.push(chans[i]);
+    });
+    return ok;
+  };
+  const p = queue.then(run, run);
+  queue = p.catch(() => {}).finally(() => { if (--pending === 0) setSending(false); });
+  return p;
 }
 
-let busy = false;
-async function runTest(i, btn) {
-  if (busy || !NM) return;
-  busy = true; btn.disabled = true; $('send').disabled = true;
+/* Modo ponte: repassa para os outros canais marcados o que chegou por um canal */
+function bridge(fromCh, m) {
+  if (!$('bridge').checked) return;
+  const targets = selectedChannels().filter((c) => c !== fromCh);
+  if (!targets.length) return;
+  // Mensagem vinda do LoRa (texto puro) sai com ttl 0: não volta a ser repassada.
+  // As outras gastam um repasse.
+  const out = fromCh === 'lora' ? m : (m.ttl > 0 ? { ...m, ttl: m.ttl - 1 } : null);
+  if (!out) { log(fromCh, 'ponte: limite de repasses atingido, não repassa'); return; }
+  log(fromCh, `ponte: repassando para ${targets.map((c) => CH_NAME[c]).join(', ')}`, 'ok');
+  // Espera um pouco (aleatório) para não falar ao mesmo tempo que outra ponte.
+  sleep(500 + Math.random() * 1500).then(() => transmit('msg', out, targets));
+}
+
+function runTest(i) {
+  if (!NM) return;
   log(null, `▶ Fase ${i + 1}: ${PHASES[i].title}`);
-  try { await transmit(PHASES[i].kind, NM.TEST_TEXT); }
-  finally { busy = false; btn.disabled = false; $('send').disabled = false; }
+  transmit(PHASES[i].kind, null, selectedChannels());
 }
 
 $('compose').addEventListener('submit', async (e) => {
   e.preventDefault();
   const text = $('text').value.trim();
-  if (!text || busy || !NM) return;
-  busy = true; $('send').disabled = true;
-  try {
-    const ok = await transmit('text', text);
-    if (ok.length) { addMessage(text, ok, true); $('text').value = ''; }
-  } finally { busy = false; $('send').disabled = false; }
+  if (!text || !NM) return;
+  const chans = selectedChannels();
+  if (!chans.length) { log(null, 'marque pelo menos um canal em "Enviar por"', 'err'); return; }
+  const msg = NM.storeCompose(text, TTL, randId(), Date.now());
+  persist(); render();
+  $('text').value = '';
+  const ok = await transmit('msg', msg, chans);
+  if (!ok.length) log(null, 'a mensagem ficou salva aqui, mas não saiu por nenhum canal', 'err');
 });
 $('text').addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('compose').requestSubmit(); }
 });
 
+/* ---------------- Exportar, importar, apagar ---------------- */
+$('exportBtn').onclick = () => {
+  const data = NM.storeExport();
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([data], { type: 'application/octet-stream' }));
+  a.download = `conversa-${new Date().toISOString().slice(0, 10)}.nmlog`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  $('toolsStatus').textContent = `arquivo com ${NM.storeList().length} mensagens. Envie por Bluetooth ou cabo para o outro aparelho.`;
+};
+$('importFile').onchange = async (e) => {
+  const f = e.target.files[0];
+  e.target.value = '';
+  if (!f) return;
+  const n = NM.storeImport(new Uint8Array(await f.arrayBuffer()), Date.now());
+  if (n < 0) { $('toolsStatus').textContent = 'esse arquivo não é uma conversa do Novo Messenger.'; return; }
+  persist(); render();
+  $('toolsStatus').textContent = n ? `${n} mensagem(ns) nova(s) juntada(s) à conversa.` : 'nada novo: você já tinha todas essas mensagens.';
+  log(null, `importado: ${n} mensagem(ns) nova(s)`, 'ok');
+};
+let clearArmed = 0;
+$('clearBtn').onclick = () => {
+  if (Date.now() - clearArmed > 4000) {
+    clearArmed = Date.now();
+    $('toolsStatus').textContent = 'toque em "Apagar conversa" de novo para confirmar.';
+    return;
+  }
+  clearArmed = 0;
+  NM.storeClear(); persist(); render();
+  $('toolsStatus').textContent = 'conversa apagada neste aparelho.';
+};
+
 /* ---------------- Início ---------------- */
-const controls = ['luzRx', 'somRx', 'loraConn', 'send'];
+const controls = ['luzRx', 'somRx', 'loraConn', 'send', 'exportBtn', 'clearBtn', 'importFile'];
 controls.forEach((id) => { $(id).disabled = true; });
 resetPhases();
-render();
 loadNM().then((m) => {
   NM = m;
+  try {
+    const saved = localStorage.getItem('nm-store');
+    if (saved && !NM.storeLoad(saved)) log(null, 'histórico salvo estava corrompido e foi ignorado', 'err');
+  } catch (_) {}
   controls.forEach((id) => { $(id).disabled = false; });
-  renderPhases();
+  renderPhases(); render();
   log(null, 'núcleo Rust carregado. Siga as fases acima.');
 }).catch((e) => log(null, 'não foi possível carregar o núcleo (nm_core.wasm): ' + e.message, 'err'));
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});

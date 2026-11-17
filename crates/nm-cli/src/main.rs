@@ -6,8 +6,9 @@
 //! ferramentas do sistema (arecord/aplay, sox, ffmpeg).
 
 use nm_core::fsk::{synth, FskConfig};
+use nm_core::message::Message;
 use nm_core::session::{Event, Receiver};
-use nm_core::{tx_bits, Payload, TEST_TEXT};
+use nm_core::{qr, qr_text, test_message, tx_bits, Payload};
 use std::io::{self, BufWriter, Read, Write};
 use std::process::ExitCode;
 
@@ -17,6 +18,7 @@ nm — Novo Messenger por som, sem internet
 USO
   nm falar \"texto\"  [-o saida.wav]   gera o som da mensagem (sem -o: PCM f32 na saída padrão)
   nm fases           [-o saida.wav]   gera as 4 fases de teste em sequência
+  nm qr \"texto\"                      mostra a mensagem como QR Code no terminal
   nm ouvir entrada.wav                decodifica um arquivo WAV
   nm ouvir -                          decodifica PCM f32 mono da entrada padrão (ao vivo)
 
@@ -25,6 +27,8 @@ OPÇÕES
   --taxa HZ       taxa de amostragem (padrão 48000)
   --ultra         usa 17,5/18,5 kHz (quase inaudível) em vez de 1,5/2,5 kHz
   --volume V      0..1 (padrão 0,8)
+  --ttl N         quantas vezes pontes podem repassar a mensagem (padrão 3)
+  --claro         QR para terminal de fundo claro (o padrão é fundo escuro)
 
 AO VIVO
   Linux:  nm falar \"oi\" | aplay -f FLOAT_LE -r 48000 -c 1
@@ -39,19 +43,23 @@ struct Opts {
     rate: u32,
     ultra: bool,
     volume: f32,
+    ttl: u8,
+    light_terminal: bool,
     out: Option<String>,
     args: Vec<String>,
 }
 
 fn parse(mut it: impl Iterator<Item = String>) -> Result<Opts, String> {
-    let mut o = Opts { bit_ms: 80.0, rate: 48_000, ultra: false, volume: 0.8, out: None, args: Vec::new() };
+    let mut o = Opts { bit_ms: 80.0, rate: 48_000, ultra: false, volume: 0.8, ttl: 3, light_terminal: false, out: None, args: Vec::new() };
     while let Some(a) = it.next() {
         let mut val = |name: &str| it.next().ok_or(format!("{name} precisa de um valor"));
         match a.as_str() {
             "--bit" => o.bit_ms = val("--bit")?.parse().map_err(|_| "--bit inválido")?,
             "--taxa" => o.rate = val("--taxa")?.parse().map_err(|_| "--taxa inválida")?,
             "--volume" => o.volume = val("--volume")?.replace(',', ".").parse().map_err(|_| "--volume inválido")?,
+            "--ttl" => o.ttl = val("--ttl")?.parse().map_err(|_| "--ttl inválido")?,
             "--ultra" => o.ultra = true,
+            "--claro" => o.light_terminal = true,
             "-o" => o.out = Some(val("-o")?),
             _ => o.args.push(a),
         }
@@ -144,14 +152,55 @@ fn emit(pcm: &[f32], o: &Opts) -> Result<(), String> {
     Ok(())
 }
 
+/// Id de mensagem sem biblioteca de números aleatórios: relógio + processo, misturados.
+fn new_id() -> u32 {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+    let mut x = nanos ^ ((std::process::id() as u64) << 32) ^ 0x9E37_79B9_7F4A_7C15;
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    x ^= x >> 33;
+    (x as u32).max(1)
+}
+
+fn message(text: &str, ttl: u8) -> Message {
+    Message::new(new_id(), 1, ttl, text)
+}
+
 fn phases_bits(bit_ms: f64) -> Vec<u8> {
     let gap = vec![0u8; (1000.0 / bit_ms) as usize];
+    let (t, m) = (test_message(), Message::new(1, 1, 0, "Olá pelo Novo Messenger ✂️"));
     let mut bits = gap.clone();
-    for (p, t) in [(Payload::Toggle, ""), (Payload::TestBytes, ""), (Payload::Text, TEST_TEXT), (Payload::Text, "Olá pelo Novo Messenger ✂️")] {
-        bits.extend(tx_bits(p, t, bit_ms));
+    for p in [Payload::Toggle, Payload::TestBytes, Payload::Message(&t), Payload::Message(&m)] {
+        bits.extend(tx_bits(p, bit_ms));
         bits.extend(&gap);
     }
     bits
+}
+
+/// Desenha o QR com meios-blocos (duas linhas de módulos por linha de texto).
+fn print_qr(text: &str, light_terminal: bool) -> Result<(), String> {
+    let q = qr::encode(text.as_bytes()).ok_or("mensagem grande demais para um QR Code")?;
+    let border = 2isize;
+    let n = q.size as isize;
+    // Em terminal escuro o bloco "█" aparece claro, então o módulo escuro vira espaço.
+    let dark = |x: isize, y: isize| (x >= 0 && y >= 0 && x < n && y < n && q.get(x as usize, y as usize)) != light_terminal;
+    let mut out = String::new();
+    let mut y = -border;
+    while y < n + border {
+        for x in -border..n + border {
+            out.push(match (dark(x, y), dark(x, y + 1)) {
+                (false, false) => '█',
+                (false, true) => '▀',
+                (true, false) => '▄',
+                (true, true) => ' ',
+            });
+        }
+        out.push('\n');
+        y += 2;
+    }
+    print!("{out}");
+    eprintln!("QR versão {} ({}×{} módulos)", q.version, q.size, q.size);
+    Ok(())
 }
 
 struct Printer {
@@ -180,11 +229,15 @@ impl Printer {
                     let name = ["sinal", "bits e bytes", "mensagem de teste", "conversa"][(p as usize - 1).min(3)];
                     eprintln!("✓ fase {p} ({name}) passou");
                 }
-                Event::Message(t) => {
+                Event::Message(m) => {
                     self.flush_bytes();
                     let mut out = io::stdout().lock();
-                    writeln!(out, "{t}")?;
+                    writeln!(out, "{}", m.text)?;
                     out.flush()?;
+                }
+                Event::Fixed(n) => {
+                    self.flush_bytes();
+                    eprintln!("  correção de erros: {n} byte(s) consertado(s)");
                 }
                 Event::Bad(b) => {
                     self.flush_bytes();
@@ -235,10 +288,12 @@ fn run() -> Result<(), String> {
     match o.args.first().map(String::as_str) {
         Some("falar") => {
             let text = o.args.get(1).ok_or("diga o texto: nm falar \"oi\"")?;
-            emit(&synth(&tx_bits(Payload::Text, text, o.bit_ms), &o.cfg(o.rate), 300.0, o.volume), &o)
+            let m = message(text, o.ttl);
+            emit(&synth(&tx_bits(Payload::Message(&m), o.bit_ms), &o.cfg(o.rate), 300.0, o.volume), &o)
         }
         Some("fases") => emit(&synth(&phases_bits(o.bit_ms), &o.cfg(o.rate), 300.0, o.volume), &o),
         Some("ouvir") => listen(&o),
+        Some("qr") => print_qr(&qr_text(&message(o.args.get(1).ok_or("diga o texto: nm qr \"oi\"")?, o.ttl)), o.light_terminal),
         _ => {
             print!("{HELP}");
             Ok(())
@@ -273,7 +328,7 @@ mod tests {
         let ev = rx.take_events();
         let phases: Vec<u8> = ev.iter().filter_map(|e| if let Event::Phase(p) = e { Some(*p) } else { None }).collect();
         assert_eq!(phases, vec![1, 2, 3, 4]);
-        assert!(ev.contains(&Event::Message("Olá pelo Novo Messenger ✂️".into())));
+        assert!(ev.contains(&Event::Message(Message::new(1, 1, 0, "Olá pelo Novo Messenger ✂️"))));
     }
 
     #[test]

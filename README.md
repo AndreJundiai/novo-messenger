@@ -1,14 +1,21 @@
 # Novo Messenger
 
-Mensagens sem internet, sem sinal de operadora e sem créditos. O mesmo núcleo em **Rust** roda no navegador (WebAssembly) e no terminal (binário nativo), e manda texto por três meios ao mesmo tempo:
+Mensagens sem internet, sem sinal de operadora e sem créditos. O mesmo núcleo em **Rust** roda no navegador (WebAssembly) e no terminal (binário nativo), e manda texto por quatro meios ao mesmo tempo:
 
 | Canal | Como funciona | Alcance | Precisa de algo extra? |
 |---|---|---|---|
 | **Luz** | A tela (ou a lanterna no Android) pisca os bits; o outro aparelho lê com a câmera | 10–30 cm, de frente | Não |
 | **Som** | Dois tons (FSK) pelo alto-falante; o outro aparelho escuta pelo microfone. Há um modo quase inaudível (17,5/18,5 kHz) | 1–2 m | Não |
 | **LoRa** | Conecta por Bluetooth a um rádio [Meshtastic](https://meshtastic.org) e manda pelo rádio | vários km | Rádio LoRa (~R$ 100–200) |
+| **QR Code** | A tela mostra a mensagem inteira num QR; o outro aparelho lê com a câmera | até ~1 m | Não |
 
 Marque mais de um canal e a mensagem sai por todos. O receptor junta as cópias repetidas.
+
+Além disso:
+
+- **Correção de erros Reed-Solomon** em luz, som e QR: bytes trocados no caminho são consertados (até 1 byte errado a cada 8, aproximadamente).
+- **Histórico local-first (CRDT):** a conversa fica salva no aparelho e pode ser exportada num arquivo `.nmlog`. Importar junta as conversas sem duplicar nada, em qualquer ordem, então dá para sincronizar por Bluetooth ou cabo, sem servidor.
+- **Modo ponte:** um aparelho repassa para os outros canais marcados o que chega por um canal. Por exemplo: ouve por som e manda pelo rádio LoRa, alcançando quilômetros. Cada mensagem tem um limite de repasses (TTL), então não fica em ciclo.
 
 ## Arquitetura
 
@@ -19,7 +26,8 @@ Marque mais de um canal e a mensagem sai por todos. O receptor junta as cópias 
  microfone ► │ fsk: Goertzel + janela de Hann, tempo pelo relógio   ┘   bits   STX/CRC   fases 1–4    │
              │      de amostras                                                                   │
              │ fsk::synth: áudio com fase contínua   ◄── tx_bits (toggle · bytes de teste · texto)  │
-             │ mesh: protobuf Meshtastic (texto)                                                  │
+             │ rs: Reed-Solomon GF(2⁸) · message: id + relógio de Lamport + TTL                   │
+             │ store: histórico CRDT (G-Set) · qr: gerador de QR Code · mesh: protobuf Meshtastic │
              └─────────────┬──────────────────────────────────────────────┬───────────────────────┘
                            │                                              │
         nm-wasm (C ABI, 69 KB, zero imports)               nm-cli (binário nativo `nm`)
@@ -37,7 +45,12 @@ Marque mais de um canal e a mensagem sai por todos. O receptor junta as cópias 
 ```
 Cargo.toml                 workspace
 crates/nm-core/            protocolo e processamento de sinal (biblioteca)
-  src/frame.rs             quadro STX + texto + checksum + ETX
+  src/frame.rs             quadro com sincronismo, tamanho e paridade Reed-Solomon
+  src/rs.rs                Reed-Solomon (codificação e correção)
+  src/message.rs           mensagem: id, relógio de Lamport, TTL, texto
+  src/store.rs             histórico CRDT, exportar/importar, salvar
+  src/qr.rs                gerador de QR Code (nível M, versões 1–40)
+  src/b64.rs               Base64 (texto do QR e histórico salvo)
   src/uart.rs              bits ↔ bytes; detector da fase 1
   src/light.rs             brilho da câmera → 0/1
   src/fsk.rs               áudio → 0/1 (Goertzel) e bits → áudio
@@ -46,6 +59,7 @@ crates/nm-core/            protocolo e processamento de sinal (biblioteca)
 crates/nm-wasm/            ponte WebAssembly (C ABI)
 crates/nm-cli/             programa de terminal `nm`
 web/                       app (index.html, app.js, nm.js, mic-worklet.js, sw.js)
+web/vendor/jsQR.js         leitor de QR para aparelhos sem leitor nativo (Apache-2.0)
 build.sh                   compila o WebAssembly para web/nm_core.wasm
 .github/workflows/         testes + publicação no GitHub Pages
 ```
@@ -74,6 +88,7 @@ cargo build --release -p nm-cli         # gera target/release/nm (nm.exe no Wind
 nm falar "Corte às 15h" -o msg.wav       # gera o som
 nm ouvir msg.wav                         # decodifica
 nm fases -o fases.wav                    # as 4 fases de teste em sequência
+nm qr "Corte às 15h"                     # QR Code no terminal, para o celular ler (--claro em terminal de fundo claro)
 
 # ao vivo no Linux
 nm falar "oi" | aplay -f FLOAT_LE -r 48000 -c 1
@@ -108,7 +123,9 @@ O **Registro da comunicação** mostra cada byte recebido, os quadros descartado
 ## Protocolo (luz e som)
 
 Funciona como uma porta serial (UART): a linha parada vale 0, e cada byte tem 1 bit de início, 8 bits de dados (o menos significativo primeiro) e 2 bits de parada. Antes de cada transmissão vai um preâmbulo 1010… para o receptor se calibrar.
-Quadro: `STX (0x02)` + texto UTF-8 (até 200 bytes) + checksum XOR (em 0x80–0xFF) + `ETX (0x03)`. Um quadro com erro é descartado.
+Quadro: `02 D5` (sincronismo) + tamanho `L` + `!L` + `L` bytes de dados + paridade Reed-Solomon (¼ dos dados, entre 8 e 48 bytes). A paridade corrige metade do seu tamanho em bytes errados, em qualquer posição. Acima disso o quadro é descartado.
+
+Dados: `[versão 2 | TTL] [id u32] [lamport u16] [texto UTF-8, até 200 bytes]`. O QR Code leva o mesmo quadro em Base64, com o prefixo `NM2:`. O rádio LoRa leva texto puro, para conversar com outros apps Meshtastic.
 
 ## Limites
 
@@ -116,8 +133,17 @@ Quadro: `STX (0x02)` + texto UTF-8 (até 200 bytes) + checksum XOR (em 0x80–0x
 - No navegador não dá para usar Bluetooth direto entre celulares, Wi-Fi Direct nem infravermelho. Para isso use o [Briar](https://briarproject.org).
 - Os testes automáticos simulam câmera e microfone. O resultado em aparelhos reais depende de luz ambiente, distância, ruído e qualidade do alto-falante.
 
-## Próximos passos
+## Plano
 
-- Correção de erros (Reed-Solomon) para luz e som, em vez de só descartar quadros com erro.
-- Repasse entre aparelhos (store-and-forward), para uma mensagem pular de celular em celular.
-- App nativo (Tauri) usando o mesmo `nm-core`, para Bluetooth direto entre celulares.
+| Etapa | Tecnologia | Situação |
+|---|---|---|
+| 1 | Protocolo de luz e som, fases de teste | ✅ pronto |
+| 2 | Núcleo em Rust → WebAssembly + terminal | ✅ pronto |
+| A | Correção de erros Reed-Solomon | ✅ pronto |
+| B | Histórico local-first (CRDT), exportar/importar, modo ponte | ✅ pronto |
+| C | Canal QR Code (gerador em Rust, leitura nativa ou jsQR) | ✅ pronto |
+| D | App nativo (Tauri 2) com o mesmo `nm-core`, para Bluetooth direto entre celulares (BLE) e Wi-Fi Direct | a fazer |
+| E | QR animado (várias imagens em sequência) para textos longos e arquivos | a fazer |
+| F | Sincronização automática do histórico entre aparelhos próximos (troca de resumos por som/QR) | a fazer |
+
+O que falta depende de testes em aparelhos reais (D precisa de Android/iOS para compilar e testar o Bluetooth).
