@@ -1,0 +1,12 @@
+[package]
+name = "nm-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "nm"
+path = "src/main.rs"
+
+[dependencies]
+nm-core = { path = "../nm-core" }

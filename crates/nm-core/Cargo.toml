@@ -1,0 +1,8 @@
+[package]
+name = "nm-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Protocolo e processamento de sinal do Novo Messenger (luz, som, LoRa)"
+
+[dependencies]
