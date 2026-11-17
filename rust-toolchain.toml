@@ -1,0 +1,5 @@
+# Versão fixa do Rust: o mesmo resultado na máquina de quem desenvolve e no GitHub.
+[toolchain]
+channel = "1.97.0"
+components = ["clippy", "rustfmt"]
+targets = ["wasm32-unknown-unknown", "aarch64-linux-android", "armv7-linux-androideabi", "x86_64-linux-android"]
