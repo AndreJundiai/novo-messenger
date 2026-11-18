@@ -17,6 +17,8 @@ pub enum Body {
     Delete { id: u64, target: u64 },
     /// Emoji vazio = tirar a reação.
     React { id: u64, target: u64, emoji: String },
+    /// Prova de que quem envia recebeu o SMS de confirmação no próprio número.
+    Verify { id: u64, code: String },
 }
 
 const TEXT: u8 = 1;
@@ -26,6 +28,7 @@ const MESSAGE: u8 = 4;
 const EDIT: u8 = 5;
 const DELETE: u8 = 6;
 const REACT: u8 = 7;
+const VERIFY: u8 = 8;
 /// Quantas confirmações cabem num envelope.
 pub const MAX_ACKS: usize = 64;
 /// Maior emoji de reação, em bytes (alguns emojis compostos passam de 20).
@@ -39,7 +42,7 @@ impl Body {
     /// `id` do conteúdo (para confirmar a entrega); `None` nas confirmações.
     pub fn id(&self) -> Option<u64> {
         match self {
-            Body::Text { id, .. } | Body::Message { id, .. } | Body::Edit { id, .. } | Body::Delete { id, .. } | Body::React { id, .. } => Some(*id),
+            Body::Text { id, .. } | Body::Message { id, .. } | Body::Edit { id, .. } | Body::Delete { id, .. } | Body::React { id, .. } | Body::Verify { id, .. } => Some(*id),
             Body::Delivered(_) | Body::Read(_) => None,
         }
     }
@@ -86,6 +89,11 @@ impl Body {
                 w.u64(*id);
                 w.u64(*target);
                 w.raw(emoji.as_bytes());
+            }
+            Body::Verify { id, code } => {
+                w.u8(VERIFY);
+                w.u64(*id);
+                w.raw(code.as_bytes());
             }
         }
         w.0
@@ -137,6 +145,10 @@ impl Body {
                     return None;
                 }
                 Body::React { id, target, emoji }
+            }
+            VERIFY => {
+                let id = r.u64()?;
+                Body::Verify { id, code: utf8(r.rest())? }
             }
             _ => return None,
         })
@@ -226,6 +238,7 @@ mod tests {
             Body::Delete { id: 11, target: 8 },
             Body::React { id: 12, target: 8, emoji: "👍🏽".into() },
             Body::React { id: 13, target: 8, emoji: String::new() },
+            Body::Verify { id: 14, code: "K7Q2M9XW4T".into() },
         ] {
             assert_eq!(Body::decode(&b.encode()), Some(b));
         }

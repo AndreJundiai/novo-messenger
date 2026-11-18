@@ -10,6 +10,7 @@ pub mod card;
 pub mod chat;
 pub mod crypto;
 pub mod nostr;
+pub mod phone;
 pub mod shield;
 mod wire;
 

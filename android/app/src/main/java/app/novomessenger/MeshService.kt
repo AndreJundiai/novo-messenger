@@ -53,7 +53,7 @@ class MeshService : Service() {
         super.onCreate()
         Notifications.ensureChannels(this)
         client = Nearby.getConnectionsClient(this)
-        nostr = NostrClient(repo, onEnvelope = { repo.receive(it) }, onConnected = { flush() })
+        nostr = NostrClient(repo, onEnvelope = { repo.receive(it) }, onConnected = { flush(); publishDirectory() })
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -69,6 +69,8 @@ class MeshService : Service() {
             running = true
             repo.onOutboxChanged = { main.post { flush() } }
             repo.onInternetToggled = { on -> main.post { if (on) nostr.start() else nostr.stop() } }
+            repo.onRelaySend = { text -> nostr.publish(text) }
+            repo.onDirectoryChanged = { main.post { publishDirectory() } }
             if (repo.internetEnabled.value) nostr.start()
             main.postDelayed(retry, RETRY_MS)
         }
@@ -187,6 +189,15 @@ class MeshService : Service() {
         if (publishedAt.size > 2000) publishedAt.entries.removeIf { now - it.value > REPUBLISH_MS }
     }
 
+    /** Publica (ou apaga) minha entrada no diretório. O resumo é lento: calcula fora da tela. */
+    private fun publishDirectory() {
+        if (nostr.connectedCount == 0) return
+        Thread {
+            val events = repo.pendingDirectoryEvents()
+            main.post { events.forEach { nostr.publish(it) } }
+        }.start()
+    }
+
     private fun updatePeers() {
         repo.peers.value = connected.size
         updateNotification()
@@ -201,6 +212,8 @@ class MeshService : Service() {
         main.removeCallbacksAndMessages(null)
         repo.onOutboxChanged = null
         repo.onInternetToggled = null
+        repo.onRelaySend = null
+        repo.onDirectoryChanged = null
         repo.peers.value = 0
         nostr.stop()
         client.stopAdvertising()

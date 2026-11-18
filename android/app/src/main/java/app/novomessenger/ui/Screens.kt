@@ -262,9 +262,11 @@ private fun ConversationRow(c: ConversationInfo, onClick: () -> Unit) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun NewContactScreen(repo: Repo, revision: Int, onBack: () -> Unit, onScan: () -> Unit, onOpen: (String) -> Unit) {
+fun NewContactScreen(repo: Repo, revision: Int, onBack: () -> Unit, onScan: () -> Unit, onPhoneBook: () -> Unit, onOpen: (String) -> Unit) {
+    val ctx = LocalContext.current
     val contacts = remember(revision) { repo.contacts() }
     val card = remember(revision) { repo.myCard() }
+    var pasted by rememberSaveable { mutableStateOf("") }
     Scaffold(
         topBar = {
             TopAppBar(
@@ -297,7 +299,33 @@ fun NewContactScreen(repo: Repo, revision: Int, onBack: () -> Unit, onScan: () -
             )
             Spacer(Modifier.height(20.dp))
             Button(onClick = onScan, modifier = Modifier.fillMaxWidth().height(52.dp)) { Text("Ler o código de alguém") }
-            Spacer(Modifier.height(28.dp))
+            Spacer(Modifier.height(10.dp))
+            OutlinedButton(onClick = onPhoneBook, modifier = Modifier.fillMaxWidth().height(52.dp)) { Text("Contatos do celular") }
+            Spacer(Modifier.height(20.dp))
+            SectionLabel("Colar código", Modifier.align(Alignment.Start))
+            Spacer(Modifier.height(6.dp))
+            OutlinedTextField(
+                value = pasted,
+                onValueChange = { pasted = it.trim() },
+                label = { Text("Código recebido por SMS ou mensagem") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            TextButton(
+                onClick = {
+                    repo.acceptCode(pasted).fold(
+                        onSuccess = {
+                            pasted = ""
+                            Toast.makeText(ctx, "${it.name} adicionado (não conferido pessoalmente)", Toast.LENGTH_LONG).show()
+                            onOpen(it.peerId)
+                        },
+                        onFailure = { Toast.makeText(ctx, it.message ?: "código inválido", Toast.LENGTH_LONG).show() },
+                    )
+                },
+                enabled = pasted.isNotBlank(),
+                modifier = Modifier.align(Alignment.End),
+            ) { Text("Adicionar pelo código") }
+            Spacer(Modifier.height(20.dp))
             if (contacts.isNotEmpty()) {
                 SectionLabel("Contatos", Modifier.align(Alignment.Start))
                 Spacer(Modifier.height(8.dp))
@@ -311,7 +339,7 @@ fun NewContactScreen(repo: Repo, revision: Int, onBack: () -> Unit, onScan: () -
                         Column(Modifier.weight(1f)) {
                             Text(c.name, fontWeight = FontWeight.SemiBold)
                             Text(
-                                (if (c.addedInPerson) "✓ adicionado pessoalmente · " else "") + "código ${c.safetyCode}",
+                                contactBadge(c) + " · código ${c.safetyCode}",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
@@ -322,4 +350,12 @@ fun NewContactScreen(repo: Repo, revision: Int, onBack: () -> Unit, onScan: () -
             }
         }
     }
+}
+
+/** "✓ adicionado pessoalmente", "✓ número confirmado por SMS" ou "não conferido". */
+fun contactBadge(c: uniffi.nm_ffi.ContactInfo): String = when {
+    c.addedInPerson -> "✓ adicionado pessoalmente"
+    c.phoneVerified -> "✓ número confirmado por SMS"
+    c.phone != null -> "aguardando confirmação por SMS"
+    else -> "não conferido pessoalmente"
 }

@@ -5,7 +5,7 @@
 //! 64 dígitos hexadecimais.
 
 use nm_chat::nostr::{self, RelayMessage};
-use nm_chat::{backup, key_id, parse_card, parse_key_id, safety_code, Chat, ChatError, ChatMessage, Contact, Conversation, Status};
+use nm_chat::{backup, key_id, parse_card, parse_key_id, phone, safety_code, Chat, ChatError, ChatMessage, Contact, Conversation, Status};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 uniffi::setup_scaffolding!();
@@ -57,6 +57,10 @@ pub struct ContactInfo {
     pub safety_code: String,
     /// Adicionado lendo o QR ao vivo.
     pub added_in_person: bool,
+    /// Número ligado ao contato (formato internacional, só dígitos).
+    pub phone: Option<String>,
+    /// O dono do número confirmou pelo código do SMS.
+    pub phone_verified: bool,
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -102,6 +106,8 @@ pub struct ReceiveResult {
     pub updated: Vec<u64>,
     pub changed: Vec<u64>,
     pub not_for_me: bool,
+    /// `peer_id` do contato que acabou de confirmar o número.
+    pub contact_verified: Option<String>,
 }
 
 /// QR Code: `size` × `size` módulos, `modules[y * size + x]` = 1 escuro.
@@ -119,6 +125,8 @@ pub enum RelayKind {
     EndOfStored,
     /// Resposta a um envio (`ok`, `info`).
     Accepted,
+    /// Entrada do diretório: `phone_hash` e o cartão em `info` (vazio = saiu do diretório).
+    Directory,
     Notice,
     Other,
 }
@@ -130,10 +138,18 @@ pub struct RelayEvent {
     pub created_at: u64,
     pub ok: bool,
     pub info: String,
+    pub phone_hash: String,
 }
 
 fn contact_info(c: &Contact) -> ContactInfo {
-    ContactInfo { peer_id: key_id(&c.key), name: c.name.clone(), safety_code: safety_code(&c.key), added_in_person: c.added_in_person }
+    ContactInfo {
+        peer_id: key_id(&c.key),
+        name: c.name.clone(),
+        safety_code: safety_code(&c.key),
+        added_in_person: c.added_in_person,
+        phone: c.phone.clone(),
+        phone_verified: c.phone_verified,
+    }
 }
 
 fn message_info(chat: &Chat, m: &ChatMessage) -> MessageInfo {
@@ -196,12 +212,31 @@ pub fn default_relays() -> Vec<String> {
     nostr::DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect()
 }
 
+/// Número no formato internacional só com dígitos; sem código de país, assume o Brasil.
+#[uniffi::export]
+pub fn normalize_phone(raw: String) -> Option<String> {
+    phone::normalize(&raw, "55")
+}
+
+/// Resumo do número para o diretório (lento de propósito: chame fora da tela principal).
+#[uniffi::export]
+pub fn phone_hash(e164: String) -> String {
+    phone::hash(&e164)
+}
+
+/// Pedido aos relays das entradas do diretório para estes resumos.
+#[uniffi::export]
+pub fn directory_request(subscription: String, phone_hashes: Vec<String>) -> String {
+    nostr::directory_request(&subscription, &phone_hashes)
+}
+
 /// Interpreta uma mensagem de texto vinda de um relay.
 #[uniffi::export]
 pub fn parse_relay_message(text: String) -> RelayEvent {
-    let blank = RelayEvent { kind: RelayKind::Other, data: None, created_at: 0, ok: false, info: String::new() };
+    let blank = RelayEvent { kind: RelayKind::Other, data: None, created_at: 0, ok: false, info: String::new(), phone_hash: String::new() };
     match nostr::parse(&text) {
         RelayMessage::Envelope { data, created_at } => RelayEvent { kind: RelayKind::Envelope, data: Some(data), created_at, ..blank },
+        RelayMessage::Directory { phone_hash, card, created_at } => RelayEvent { kind: RelayKind::Directory, info: card, phone_hash, created_at, ..blank },
         RelayMessage::EndOfStored => RelayEvent { kind: RelayKind::EndOfStored, ..blank },
         RelayMessage::Accepted { ok, reason } => RelayEvent { kind: RelayKind::Accepted, ok, info: reason, ..blank },
         RelayMessage::Notice(n) => RelayEvent { kind: RelayKind::Notice, info: n, ..blank },
@@ -383,12 +418,40 @@ impl Messenger {
     pub fn receive(&self, data: Vec<u8>, now_ms: u64) -> ReceiveResult {
         let mut chat = self.chat();
         let r = chat.receive(&data, now_ms);
-        ReceiveResult { message: r.message.as_ref().map(|m| message_info(&chat, m)), updated: r.updated, changed: r.changed, not_for_me: r.not_for_me }
+        ReceiveResult {
+            message: r.message.as_ref().map(|m| message_info(&chat, m)),
+            updated: r.updated,
+            changed: r.changed,
+            not_for_me: r.not_for_me,
+            contact_verified: r.contact_verified.as_ref().map(key_id),
+        }
     }
 
     /// Evento Nostr `["EVENT", …]` levando `data` para `to_peer_id` pela internet.
     pub fn relay_event(&self, to_peer_id: String, data: Vec<u8>, now_s: u64) -> Result<String, NmError> {
         Ok(nostr::event(&peer(&to_peer_id)?, &data, now_s))
+    }
+
+    /// Contato encontrado pelo número no diretório (fica "não confirmado").
+    pub fn add_found_contact(&self, card: String, phone: String) -> Result<ContactInfo, NmError> {
+        Ok(contact_info(&self.chat().add_found_contact(&card, &phone)?))
+    }
+
+    /// Texto do código de confirmação para mandar por SMS ao número do contato.
+    pub fn verification_code(&self, peer_id: String) -> Result<String, NmError> {
+        Ok(self.chat().verification_code(&peer(&peer_id)?)?)
+    }
+
+    /// Código colado pela pessoa (contato recebido por outro meio ou confirmação de SMS).
+    pub fn accept_code(&self, text: String, now_ms: u64) -> Result<ContactInfo, NmError> {
+        Ok(contact_info(&self.chat().accept_code(&text, now_ms)?))
+    }
+
+    /// Publica (ou, com `listed` falso, apaga) minha entrada no diretório para o resumo do meu número.
+    pub fn directory_event(&self, phone_hash: String, listed: bool, now_s: u64) -> String {
+        let chat = self.chat();
+        let card = if listed { chat.my_card() } else { String::new() };
+        nostr::directory_event(&chat.identity_secret(), &phone_hash, &card, now_s)
     }
 
     /// Pedido `["REQ", …]` das mensagens para este aparelho desde `since_s`.
@@ -432,6 +495,31 @@ mod tests {
         assert_eq!(card_name(b.my_card()).as_deref(), Some("Bruno"));
         let impostor = Messenger::create("bruno".into());
         assert_eq!(a.similar_contacts(impostor.my_card()).len(), 1);
+    }
+
+    #[test]
+    fn phone_directory_and_sms_confirmation() {
+        let a = Messenger::create("Ana".into());
+        let b = Messenger::create("Bruno".into());
+        let num = normalize_phone("(11) 98765-4321".into()).unwrap();
+        assert_eq!(num, "5511987654321");
+        let h = phone_hash(num.clone());
+        // B publica no diretório; o relay devolve para A, que acha o cartão de B.
+        let ev: serde_json::Value = serde_json::from_str(&b.directory_event(h.clone(), true, 10)).unwrap();
+        let found = parse_relay_message(serde_json::json!(["EVENT", "dir", ev[1]]).to_string());
+        assert_eq!(found.kind, RelayKind::Directory);
+        assert_eq!(found.phone_hash, h);
+        let c = a.add_found_contact(found.info, num).unwrap();
+        assert!(!c.phone_verified);
+        let sms = a.verification_code(c.peer_id.clone()).unwrap();
+        b.accept_code(sms, 11).unwrap();
+        let mut ok = None;
+        for p in b.outbox() {
+            ok = ok.or(a.receive(p.data, 12).contact_verified);
+        }
+        assert_eq!(ok, Some(b.my_id()));
+        assert!(a.contact(b.my_id()).unwrap().phone_verified);
+        assert!(directory_request("dir".into(), vec![h]).contains("nm-dir:"));
     }
 
     #[test]

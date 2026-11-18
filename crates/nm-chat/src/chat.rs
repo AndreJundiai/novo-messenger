@@ -9,17 +9,23 @@
 //! conexão, por qualquer transporte (Bluetooth, Wi-Fi, internet, rádio).
 //! Quem recebe ignora cópias pelo `id`, mas confirma de novo.
 
-use crate::card::{clean_name, make_card, parse_card};
+use crate::card::{clean_name, make_card, parse_card, MAX_NAME_BYTES};
 use crate::crypto::{self, Identity, KeyBytes};
 use crate::shield;
 use crate::wire::{Body, Reader, Writer, MAX_ACKS, MAX_EMOJI_BYTES};
-use rand_core::{CryptoRngCore, OsRng};
+use nm_core::b64;
+use rand_core::{CryptoRngCore, OsRng, RngCore};
 use std::collections::{BTreeMap, HashMap};
 
 /// Maior texto de uma mensagem, em bytes UTF-8.
 pub const MAX_TEXT_BYTES: usize = 4000;
 const SAVE_V1: &[u8; 8] = b"NMCHAT01";
 const SAVE_V2: &[u8; 8] = b"NMCHAT02";
+const SAVE_V3: &[u8; 8] = b"NMCHAT03";
+/// Código de confirmação por SMS: `NMV1:` + Base64(chave 32 ‖ código 10 ‖ nome).
+pub const VERIFY_PREFIX: &str = "NMV1:";
+const CODE_LEN: usize = 10;
+const CODE_ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Status {
@@ -47,6 +53,16 @@ pub struct Contact {
     pub name: String,
     /// Adicionado lendo o QR ao vivo (selo "conferido pessoalmente").
     pub added_in_person: bool,
+    /// Número de telefone ligado a este contato (formato internacional, só dígitos).
+    pub phone: Option<String>,
+    /// O dono do número confirmou pelo código enviado por SMS.
+    pub phone_verified: bool,
+}
+
+impl Contact {
+    fn new(key: KeyBytes, name: String, added_in_person: bool) -> Self {
+        Self { key, name, added_in_person, phone: None, phone_verified: false }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,6 +138,8 @@ pub struct Received {
     pub changed: Vec<u64>,
     /// O envelope não era para este aparelho (a fase 2 vai guardar e repassar).
     pub not_for_me: bool,
+    /// Um contato confirmou o número pelo SMS.
+    pub contact_verified: Option<KeyBytes>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -171,6 +189,8 @@ pub struct Chat {
     sealed: HashMap<u64, Sealed>,
     /// Confirmações a enviar na próxima oportunidade (saem uma vez).
     acks: Vec<(KeyBytes, Vec<u8>)>,
+    /// Códigos de SMS enviados e ainda não confirmados: contato → (número, código).
+    pending_verify: HashMap<KeyBytes, (String, String)>,
 }
 
 fn check_text(text: &str) -> Result<String, ChatError> {
@@ -198,11 +218,17 @@ impl Chat {
             messages: BTreeMap::new(),
             sealed: HashMap::new(),
             acks: Vec::new(),
+            pending_verify: HashMap::new(),
         }
     }
 
     pub fn my_key(&self) -> &KeyBytes {
         self.me.public()
+    }
+
+    /// Segredo da identidade, para derivar a chave do diretório. Não exponha ao app.
+    pub fn identity_secret(&self) -> [u8; 32] {
+        self.me.secret_bytes()
     }
 
     pub fn my_name(&self) -> &str {
@@ -227,8 +253,67 @@ impl Chat {
             return Err(ChatError::OwnCard);
         }
         let name = if c.name.is_empty() { "Sem nome".to_string() } else { c.name };
-        let contact = Contact { key: c.key, name, added_in_person: true };
-        self.contacts.insert(c.key, contact.clone());
+        let contact = self.contacts.entry(c.key).or_insert_with(|| Contact::new(c.key, name.clone(), true));
+        contact.name = name;
+        contact.added_in_person = true;
+        Ok(contact.clone())
+    }
+
+    /// Contato encontrado pelo número no diretório: entra como "não confirmado"
+    /// até o dono do número responder ao SMS ([`Chat::verification_code`]).
+    pub fn add_found_contact(&mut self, card: &str, phone: &str) -> Result<Contact, ChatError> {
+        let c = parse_card(card).ok_or(ChatError::InvalidCard)?;
+        if &c.key == self.me.public() {
+            return Err(ChatError::OwnCard);
+        }
+        let name = if c.name.is_empty() { "Sem nome".to_string() } else { c.name };
+        let contact = self.contacts.entry(c.key).or_insert_with(|| Contact::new(c.key, name, false));
+        if contact.phone.as_deref() != Some(phone) {
+            contact.phone = Some(phone.to_string());
+            contact.phone_verified = false;
+        }
+        Ok(contact.clone())
+    }
+
+    /// Texto para mandar por SMS ao número do contato. Só quem tem aquele chip
+    /// recebe; quando ele colar o código no app, o número fica confirmado.
+    pub fn verification_code(&mut self, key: &KeyBytes) -> Result<String, ChatError> {
+        let phone = self.contacts.get(key).and_then(|c| c.phone.clone()).ok_or(ChatError::UnknownContact)?;
+        let code: String = (0..CODE_LEN).map(|_| CODE_ALPHABET[(OsRng.next_u32() % 32) as usize] as char).collect();
+        self.pending_verify.insert(*key, (phone, code.clone()));
+        let mut payload = self.me.public().to_vec();
+        payload.extend_from_slice(code.as_bytes());
+        payload.extend_from_slice(self.name.as_bytes());
+        Ok(format!("{VERIFY_PREFIX}{}", b64::encode(&payload)))
+    }
+
+    /// Código colado pela pessoa: um cartão (`NMC1:`) recebido por outro meio, ou
+    /// o código de confirmação (`NMV1:`) que chegou por SMS. Nos dois casos o
+    /// contato não foi conferido pessoalmente.
+    pub fn accept_code(&mut self, text: &str, now_ms: u64) -> Result<Contact, ChatError> {
+        let text = text.trim();
+        if let Some(c) = parse_card(text) {
+            if &c.key == self.me.public() {
+                return Err(ChatError::OwnCard);
+            }
+            let name = if c.name.is_empty() { "Sem nome".to_string() } else { c.name };
+            let contact = self.contacts.entry(c.key).or_insert_with(|| Contact::new(c.key, name, false));
+            return Ok(contact.clone());
+        }
+        let bytes = text.strip_prefix(VERIFY_PREFIX).and_then(b64::decode).ok_or(ChatError::InvalidCard)?;
+        if bytes.len() < 32 + CODE_LEN || bytes.len() > 32 + CODE_LEN + MAX_NAME_BYTES {
+            return Err(ChatError::InvalidCard);
+        }
+        let key: KeyBytes = bytes[..32].try_into().map_err(|_| ChatError::InvalidCard)?;
+        if &key == self.me.public() {
+            return Err(ChatError::OwnCard);
+        }
+        let code = String::from_utf8(bytes[32..32 + CODE_LEN].to_vec()).map_err(|_| ChatError::InvalidCard)?;
+        let name = clean_name(&String::from_utf8_lossy(&bytes[32 + CODE_LEN..]));
+        let name = if name.is_empty() { "Sem nome".to_string() } else { name };
+        let contact = self.contacts.entry(key).or_insert_with(|| Contact::new(key, name, false)).clone();
+        let id = self.new_id(&mut OsRng);
+        self.queue(&key, &Body::Verify { id, code }, now_ms, &mut OsRng)?;
         Ok(contact)
     }
 
@@ -470,6 +555,16 @@ impl Chat {
                     }
                 }
             }
+            Body::Verify { id, code } => {
+                self.queue_ack(&from, Body::Delivered(vec![id]));
+                if self.pending_verify.get(&from).is_some_and(|(_, c)| *c == code) {
+                    if let (Some((phone, _)), Some(c)) = (self.pending_verify.remove(&from), self.contacts.get_mut(&from)) {
+                        c.phone = Some(phone);
+                        c.phone_verified = true;
+                        r.contact_verified = Some(from);
+                    }
+                }
+            }
             Body::Delivered(ids) => self.apply_acks(&from, &ids, Status::Delivered, &mut r.updated),
             Body::Read(ids) => self.apply_acks(&from, &ids, Status::Read, &mut r.updated),
         }
@@ -587,7 +682,7 @@ impl Chat {
 
     pub fn save(&self) -> Vec<u8> {
         let mut w = Writer::default();
-        w.raw(SAVE_V2);
+        w.raw(SAVE_V3);
         w.raw(&self.me.secret_bytes());
         w.bytes(self.name.as_bytes());
         w.u8(self.money_alerts as u8);
@@ -596,6 +691,8 @@ impl Chat {
             w.raw(&c.key);
             w.bytes(c.name.as_bytes());
             w.u8(c.added_in_person as u8);
+            w.bytes(c.phone.as_deref().unwrap_or("").as_bytes());
+            w.u8(c.phone_verified as u8);
         }
         w.u32(self.messages.len() as u32);
         for m in self.messages.values() {
@@ -629,19 +726,27 @@ impl Chat {
             w.raw(to);
             w.bytes(a);
         }
+        w.u32(self.pending_verify.len() as u32);
+        for (k, (phone, code)) in &self.pending_verify {
+            w.raw(k);
+            w.bytes(phone.as_bytes());
+            w.bytes(code.as_bytes());
+        }
         w.0
     }
 
     pub fn load(data: &[u8]) -> Result<Chat, ChatError> {
         match data.get(..8) {
-            Some(m) if m == SAVE_V2 => Self::read_v2(data),
+            Some(m) if m == SAVE_V3 => Self::read_v23(data, true),
+            Some(m) if m == SAVE_V2 => Self::read_v23(data, false),
             Some(m) if m == SAVE_V1 => Self::read_v1(data),
             _ => None,
         }
         .ok_or(ChatError::InvalidData)
     }
 
-    fn read_v2(data: &[u8]) -> Option<Chat> {
+    /// Formatos 2 e 3 (o 3 acrescenta o telefone dos contatos e os códigos pendentes).
+    fn read_v23(data: &[u8], v3: bool) -> Option<Chat> {
         let mut r = Reader::new(&data[8..]);
         let me = Identity::from_secret(r.key()?);
         let name = r.string()?;
@@ -650,7 +755,12 @@ impl Chat {
         for _ in 0..r.u32()? {
             let key = r.key()?;
             let name = r.string()?;
-            chat.contacts.insert(key, Contact { key, name, added_in_person: r.u8()? != 0 });
+            let mut c = Contact::new(key, name, r.u8()? != 0);
+            if v3 {
+                c.phone = Some(r.string()?).filter(|p| !p.is_empty());
+                c.phone_verified = r.u8()? != 0;
+            }
+            chat.contacts.insert(key, c);
         }
         let opt = |s: String| (!s.is_empty()).then_some(s);
         for _ in 0..r.u32()? {
@@ -680,6 +790,13 @@ impl Chat {
             let to = r.key()?;
             chat.acks.push((to, r.bytes()?.to_vec()));
         }
+        if v3 {
+            for _ in 0..r.u32()? {
+                let k = r.key()?;
+                let phone = r.string()?;
+                chat.pending_verify.insert(k, (phone, r.string()?));
+            }
+        }
         r.done().then_some(chat)
     }
 
@@ -692,7 +809,7 @@ impl Chat {
         for _ in 0..r.u32()? {
             let key = r.key()?;
             // Na fase 1 a única forma de adicionar era pelo QR.
-            chat.contacts.insert(key, Contact { key, name: r.string()?, added_in_person: true });
+            chat.contacts.insert(key, Contact::new(key, r.string()?, true));
         }
         for _ in 0..r.u32()? {
             let id = r.u64()?;
@@ -877,6 +994,53 @@ mod tests {
         assert_eq!(sim.len(), 1);
         assert_eq!(sim[0].name, "Bruno");
         assert!(a.contacts()[0].added_in_person);
+    }
+
+    #[test]
+    fn phone_verification_by_sms_code() {
+        let mut a = Chat::new("Ana");
+        let mut b = Chat::new("Bruno");
+        // A encontra B pelo número no diretório.
+        let found = a.add_found_contact(&b.my_card(), "5511987654321").unwrap();
+        assert!(!found.added_in_person && !found.phone_verified);
+        let sms = a.verification_code(b.my_key()).unwrap();
+        assert!(sms.starts_with(VERIFY_PREFIX));
+        // B recebe o SMS no chip dele e cola o código: adiciona A e responde cifrado.
+        let added = b.accept_code(&sms, 1).unwrap();
+        assert_eq!(&added.key, a.my_key());
+        assert!(!added.added_in_person);
+        let mut verified = None;
+        for o in b.outbox() {
+            verified = verified.or(a.receive(&o.data, 2).contact_verified);
+        }
+        assert_eq!(verified, Some(*b.my_key()));
+        let c = a.contact(b.my_key()).unwrap();
+        assert!(c.phone_verified && c.phone.as_deref() == Some("5511987654321"));
+        // Salvar e abrir de novo mantém o número confirmado.
+        assert!(Chat::load(&a.save()).unwrap().contact(b.my_key()).unwrap().phone_verified);
+    }
+
+    #[test]
+    fn impostor_in_directory_cannot_verify() {
+        // Eve publicou o número da Mãe com a chave dela. A Ana adiciona e manda o SMS:
+        // o SMS vai para o chip da Mãe de verdade, que não é a Eve.
+        let mut ana = Chat::new("Ana");
+        let mut eve = Chat::new("Mãe");
+        let mut mae = Chat::new("Mãe");
+        ana.add_found_contact(&eve.my_card(), "5511900000000").unwrap();
+        let sms = ana.verification_code(eve.my_key()).unwrap();
+        mae.accept_code(&sms, 1).unwrap(); // a Mãe verdadeira recebeu o SMS
+        for o in mae.outbox() {
+            assert_eq!(ana.receive(&o.data, 2).contact_verified, None, "a mãe de verdade não é contato da Ana");
+        }
+        // Eve tenta adivinhar o código.
+        eve.add_contact(&ana.my_card()).unwrap();
+        let body = Body::Verify { id: 9, code: "AAAAAAAAAA".into() };
+        let env = crypto::seal(&eve.me, ana.my_key(), &body.encode(), &mut OsRng).unwrap();
+        assert_eq!(ana.receive(&env, 3).contact_verified, None);
+        assert!(!ana.contact(eve.my_key()).unwrap().phone_verified);
+        assert!(ana.accept_code("NMV1:lixo", 4).is_err());
+        assert!(ana.accept_code(&ana.my_card(), 4).is_err());
     }
 
     #[test]

@@ -24,6 +24,7 @@ A pasta `android/` tem o app nativo, com a cara de um mensageiro moderno:
 - **Com e sem internet:** com conexão, as mensagens vão por relays públicos do [Nostr](https://nostr.com) (sem servidor próprio); sem conexão, vão direto de celular em celular por Bluetooth e Wi-Fi. O app escolhe sozinho e descarta cópias.
 - **Do WhatsApp e do Telegram:** ✓ / ✓✓ / ✓✓ azul, responder citando, reagir com emoji, editar, apagar para todos, apagar para mim e busca nas conversas.
 - **Escudo contra golpes:** contato só entra pelo QR, pessoalmente (sem número de telefone); aviso de nome parecido ("troquei de número"); alerta quando uma mensagem pede Pix, transferência ou código. Tudo analisado no próprio aparelho.
+- **Agenda do celular:** mostra quais contatos têm o app (para quem ativar o diretório opcional, que publica só um resumo embaralhado do número). Adicionar alguém pelo número manda um **SMS de confirmação**: só o dono do chip consegue confirmar, então quem cadastrar o número de outra pessoa não se passa por ela. Para quem não tem o app: **convite por SMS** ou **SMS comum** (sem cifra, pode gastar créditos).
 - **Backup cifrado com senha, sem nuvem.**
 - Criptografia de ponta a ponta em todos os caminhos; os relays da internet só veem dados cifrados.
 

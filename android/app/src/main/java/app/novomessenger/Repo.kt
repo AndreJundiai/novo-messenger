@@ -36,6 +36,12 @@ class Repo(private val context: Context) {
     /** Usar a internet (relays Nostr) quando houver conexão. */
     val internetEnabled = MutableStateFlow(prefs.getBoolean("internet", true))
 
+    /** Diretório: resumo do número → cartão de quem tem o app (vindo dos relays). */
+    val directory = MutableStateFlow<Map<String, String>>(emptyMap())
+
+    /** Resumos já calculados (o cálculo é lento de propósito). */
+    private val hashCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+
     /** O app está na tela (para não notificar à toa). */
     @Volatile var foreground = false
 
@@ -47,6 +53,12 @@ class Repo(private val context: Context) {
 
     /** O serviço de rede liga ou desliga a internet quando a preferência muda. */
     @Volatile var onInternetToggled: ((Boolean) -> Unit)? = null
+
+    /** O serviço de rede manda este pedido aos relays (busca no diretório). */
+    @Volatile var onRelaySend: ((String) -> Boolean)? = null
+
+    /** O serviço de rede republica minha entrada no diretório quando ela muda. */
+    @Volatile var onDirectoryChanged: (() -> Unit)? = null
 
     init {
         if (file.exists()) {
@@ -179,6 +191,78 @@ class Repo(private val context: Context) {
         Result.failure(e)
     }
 
+    // ---------- agenda e diretório ----------
+
+    /** Meu número (opcional, só dígitos com código do país). */
+    fun myPhone(): String = prefs.getString("my_phone", "").orEmpty()
+
+    /** Aparecer para quem tem meu número salvo. Desligado por padrão. */
+    fun discoverable(): Boolean = prefs.getBoolean("discoverable", false)
+
+    /** Salva meu número; devolve falso se não parecer um número. */
+    fun setMyPhone(raw: String): Boolean {
+        val n = if (raw.isBlank()) "" else uniffi.nm_ffi.normalizePhone(raw) ?: return false
+        prefs.edit().putString("my_phone", n).apply()
+        onDirectoryChanged?.invoke()
+        return true
+    }
+
+    fun setDiscoverable(on: Boolean) {
+        prefs.edit().putBoolean("discoverable", on).apply()
+        onDirectoryChanged?.invoke()
+        revision.value += 1
+    }
+
+    fun phoneHash(e164: String): String = hashCache.getOrPut(e164) { uniffi.nm_ffi.phoneHash(e164) }
+
+    /**
+     * Evento do diretório a publicar agora, ou nada. Também apaga a entrada
+     * antiga quando a pessoa desliga a opção ou troca de número.
+     */
+    fun pendingDirectoryEvents(): List<String> {
+        val m = messenger ?: return emptyList()
+        val now = (System.currentTimeMillis() / 1000).toULong()
+        val out = mutableListOf<String>()
+        val published = prefs.getString("dir_published", "").orEmpty()
+        val wanted = if (discoverable() && myPhone().isNotEmpty()) phoneHash(myPhone()) else ""
+        if (published.isNotEmpty() && published != wanted) out += m.directoryEvent(published, false, now)
+        if (wanted.isNotEmpty()) out += m.directoryEvent(wanted, true, now)
+        prefs.edit().putString("dir_published", wanted).apply()
+        return out
+    }
+
+    /** Procura no diretório quem destes números tem o app. Devolve falso sem internet. */
+    fun queryDirectory(hashes: List<String>): Boolean {
+        val send = onRelaySend ?: return false
+        var any = false
+        hashes.chunked(100).forEachIndexed { i, chunk ->
+            if (send(uniffi.nm_ffi.directoryRequest("dir$i", chunk))) any = true
+        }
+        return any
+    }
+
+    fun onDirectory(hash: String, card: String) {
+        val cur = directory.value
+        directory.value = if (card.isEmpty()) cur - hash else cur + (hash to card)
+    }
+
+    fun addFoundContact(card: String, phone: String): Result<ContactInfo> =
+        attempt { it.addFoundContact(card, phone) }.onSuccess { changed() }
+
+    /** Texto do SMS de confirmação para o número do contato. */
+    fun verificationSms(peerId: String): Result<String> = attempt { code ->
+        val text = code.verificationCode(peerId)
+        changed()
+        "Novo Messenger: ${myName()} quer confirmar que este número é seu. Abra o app, toque em + → Colar código e cole: $text\n(Não é cobrança nem pedido de dinheiro.)"
+    }
+
+    /** Código colado pela pessoa (cartão ou confirmação de SMS). */
+    fun acceptCode(text: String): Result<ContactInfo> = action { it.acceptCode(text, nowMs()) }
+
+    fun inviteSms(): String =
+        "Oi! Estou usando o Novo Messenger, que funciona com e sem internet. Baixe em $INVITE_URL " +
+            "e, no app, toque em + → Colar código e cole o meu: ${myCard()}"
+
     // ---------- internet ----------
 
     fun setInternetEnabled(on: Boolean) {
@@ -218,6 +302,11 @@ class Repo(private val context: Context) {
         val m = messenger ?: return
         val r = m.receive(data, nowMs())
         val msg = r.message
+        r.contactVerified?.let { id ->
+            changed()
+            val name = contact(id)?.name ?: "Contato"
+            Notifications.message(context, id, name, "$name confirmou o número pelo SMS ✓")
+        }
         if (msg == null && r.updated.isEmpty() && r.changed.isEmpty()) {
             // Cópia repetida: pode haver confirmação nova para mandar.
             onOutboxChanged?.invoke()
@@ -239,5 +328,6 @@ class Repo(private val context: Context) {
 
     companion object {
         private const val TAG = "NovoMessenger"
+        const val INVITE_URL = "https://github.com/AndreJundiai/novo-messenger"
     }
 }

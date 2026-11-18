@@ -24,6 +24,9 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!-- Agenda: mostrar quais contatos têm o app (só lida no aparelho) -->
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
+
     <!-- Ler o QR de contato -->
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />

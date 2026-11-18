@@ -144,6 +144,9 @@ fun SettingsScreen(repo: Repo, revision: Int, onBack: () -> Unit) {
     var exportData by remember { mutableStateOf<ByteArray?>(null) }
     var restoreData by remember { mutableStateOf<ByteArray?>(null) }
     var editingName by rememberSaveable { mutableStateOf<String?>(null) }
+    var editingPhone by rememberSaveable { mutableStateOf<String?>(null) }
+    val discoverable = remember(revision) { repo.discoverable() }
+    val myPhone = remember(revision, editingPhone) { repo.myPhone() }
 
     val create = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
         val data = exportData
@@ -205,6 +208,33 @@ fun SettingsScreen(repo: Repo, revision: Int, onBack: () -> Unit) {
         )
     }
 
+    editingPhone?.let { current ->
+        var number by remember { mutableStateOf(current) }
+        AlertDialog(
+            onDismissRequest = { editingPhone = null },
+            title = { Text("Meu número") },
+            text = {
+                Column {
+                    Text("Opcional. Fica só neste aparelho; no diretório vai apenas um resumo embaralhado.", style = MaterialTheme.typography.bodySmall)
+                    OutlinedTextField(
+                        value = number,
+                        onValueChange = { number = it },
+                        singleLine = true,
+                        placeholder = { Text("(11) 98765-4321") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    if (repo.setMyPhone(number)) editingPhone = null
+                    else Toast.makeText(ctx, "Esse número não parece válido", Toast.LENGTH_SHORT).show()
+                }) { Text("Salvar") }
+            },
+            dismissButton = { TextButton(onClick = { editingPhone = null }) { Text("Cancelar") } },
+        )
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -221,6 +251,14 @@ fun SettingsScreen(repo: Repo, revision: Int, onBack: () -> Unit) {
         Column(Modifier.padding(pad).fillMaxSize().verticalScroll(rememberScrollState())) {
             SectionLabel("Você", Modifier.padding(start = 20.dp, top = 20.dp, bottom = 4.dp))
             SettingRow(repo.myName(), "Toque para mudar · código de segurança ${repo.mySafetyCode()}") { editingName = repo.myName() }
+            SettingRow("Meu número", if (myPhone.isEmpty()) "Opcional · não informado" else "+$myPhone") { editingPhone = myPhone }
+            SettingRow(
+                "Deixar quem tem meu número me encontrar",
+                "Quem tem seu número salvo vê que você tem o app. Vai só um resumo embaralhado do número, mas números podem ser adivinhados com muito esforço: ative só se quiser.",
+                checked = discoverable,
+            ) {
+                if (myPhone.isEmpty() && !discoverable) editingPhone = "" else repo.setDiscoverable(!discoverable)
+            }
             HorizontalDivider()
 
             SectionLabel("Rede", Modifier.padding(start = 20.dp, top = 20.dp, bottom = 4.dp))

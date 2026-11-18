@@ -30,6 +30,7 @@ sealed interface Screen {
     data object Scan : Screen
     data object Search : Screen
     data object Settings : Screen
+    data object PhoneContacts : Screen
     data class Chat(val peerId: String) : Screen
 }
 
@@ -87,7 +88,7 @@ fun App(repo: Repo, onMeshAllowed: () -> Unit) {
     var pendingCard by remember { mutableStateOf<Pair<String, List<ContactInfo>>?>(null) }
 
     BackHandler(enabled = screen != Screen.Conversations) {
-        screen = if (screen == Screen.Scan) Screen.NewContact else Screen.Conversations
+        screen = if (screen == Screen.Scan || screen == Screen.PhoneContacts) Screen.NewContact else Screen.Conversations
     }
 
     fun add(card: String) {
@@ -137,6 +138,14 @@ fun App(repo: Repo, onMeshAllowed: () -> Unit) {
             revision = revision,
             onBack = { screen = Screen.Conversations },
             onScan = { screen = Screen.Scan },
+            onPhoneBook = { screen = Screen.PhoneContacts },
+            onOpen = { screen = Screen.Chat(it) },
+        )
+        Screen.PhoneContacts -> PhoneContactsScreen(
+            repo = repo,
+            revision = revision,
+            relays = relays,
+            onBack = { screen = Screen.NewContact },
             onOpen = { screen = Screen.Chat(it) },
         )
         Screen.Scan -> ScanScreen(

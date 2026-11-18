@@ -81,6 +81,7 @@ class NostrClient(
                         onEnvelope(data)
                     }
                 }
+                RelayKind.DIRECTORY -> main.post { repo.onDirectory(e.phoneHash, e.info) }
                 RelayKind.ACCEPTED -> if (!e.ok) Log.w(TAG, "$url recusou: ${e.info}")
                 RelayKind.NOTICE -> Log.i(TAG, "$url avisa: ${e.info}")
                 else -> {}
@@ -107,7 +108,7 @@ class NostrClient(
         }
     }
 
-    /** Manda um evento para todos os relays conectados. Devolve se algum aceitou na fila. */
+    /** Manda um evento ou pedido para todos os relays conectados. Devolve se algum aceitou na fila. */
     fun publish(eventJson: String): Boolean {
         var any = false
         for (ws in open.values) {

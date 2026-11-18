@@ -223,7 +223,8 @@ fun ChatScreen(repo: Repo, revision: Int, peers: Int, relays: Int, peerId: Strin
             item {
                 Text(
                     "Cifrado de ponta a ponta: ninguém no caminho lê, nem os servidores da internet." +
-                        (contact?.let { c -> "\n" + (if (c.addedInPerson) "✓ Adicionado pessoalmente · " else "") + "código ${c.safetyCode}" } ?: ""),
+                        (contact?.let { c -> "\n" + contactBadge(c) + " · código ${c.safetyCode}" } ?: "") +
+                        (if (contact != null && !contact.addedInPerson && !contact.phoneVerified) "\nAinda não confirmado: desconfie de pedidos de dinheiro e confira por ligação." else ""),
                     style = MaterialTheme.typography.bodySmall,
                     textAlign = TextAlign.Center,
                     color = colors.meta,
