@@ -4,7 +4,8 @@
 //! Contatos e conversas são identificados por `peer_id`: a chave pública em
 //! 64 dígitos hexadecimais.
 
-use nm_chat::{key_id, parse_key_id, safety_code, Chat, ChatError, ChatMessage, Contact, Conversation, Status};
+use nm_chat::nostr::{self, RelayMessage};
+use nm_chat::{backup, key_id, parse_card, parse_key_id, safety_code, Chat, ChatError, ChatMessage, Contact, Conversation, Status};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 uniffi::setup_scaffolding!();
@@ -54,6 +55,8 @@ pub struct ContactInfo {
     pub name: String,
     /// Código para conferir pessoalmente que é a pessoa certa.
     pub safety_code: String,
+    /// Adicionado lendo o QR ao vivo.
+    pub added_in_person: bool,
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -65,6 +68,13 @@ pub struct MessageInfo {
     pub at_ms: u64,
     pub status: MessageStatus,
     pub read: bool,
+    pub reply_to: Option<u64>,
+    pub edited: bool,
+    pub deleted: bool,
+    pub my_reaction: Option<String>,
+    pub peer_reaction: Option<String>,
+    /// Mostrar o alerta "pedido de dinheiro".
+    pub money_alert: bool,
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -75,12 +85,14 @@ pub struct ConversationInfo {
     pub last_at_ms: u64,
     pub last_outgoing: bool,
     pub last_status: MessageStatus,
+    pub last_deleted: bool,
     pub unread: u32,
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct OutgoingPacket {
     pub message_id: Option<u64>,
+    pub to_peer_id: String,
     pub data: Vec<u8>,
 }
 
@@ -88,6 +100,7 @@ pub struct OutgoingPacket {
 pub struct ReceiveResult {
     pub message: Option<MessageInfo>,
     pub updated: Vec<u64>,
+    pub changed: Vec<u64>,
     pub not_for_me: bool,
 }
 
@@ -98,12 +111,47 @@ pub struct QrImage {
     pub modules: Vec<u8>,
 }
 
-fn contact_info(c: &Contact) -> ContactInfo {
-    ContactInfo { peer_id: key_id(&c.key), name: c.name.clone(), safety_code: safety_code(&c.key) }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum RelayKind {
+    /// Chegou um envelope (`data`).
+    Envelope,
+    /// O relay terminou de mandar o que estava guardado.
+    EndOfStored,
+    /// Resposta a um envio (`ok`, `info`).
+    Accepted,
+    Notice,
+    Other,
 }
 
-fn message_info(m: &ChatMessage) -> MessageInfo {
-    MessageInfo { id: m.id, peer_id: key_id(&m.peer), outgoing: m.outgoing, text: m.text.clone(), at_ms: m.at_ms, status: m.status.into(), read: m.read }
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct RelayEvent {
+    pub kind: RelayKind,
+    pub data: Option<Vec<u8>>,
+    pub created_at: u64,
+    pub ok: bool,
+    pub info: String,
+}
+
+fn contact_info(c: &Contact) -> ContactInfo {
+    ContactInfo { peer_id: key_id(&c.key), name: c.name.clone(), safety_code: safety_code(&c.key), added_in_person: c.added_in_person }
+}
+
+fn message_info(chat: &Chat, m: &ChatMessage) -> MessageInfo {
+    MessageInfo {
+        id: m.id,
+        peer_id: key_id(&m.peer),
+        outgoing: m.outgoing,
+        text: m.text.clone(),
+        at_ms: m.at_ms,
+        status: m.status.into(),
+        read: m.read,
+        reply_to: m.reply_to,
+        edited: m.edited,
+        deleted: m.deleted,
+        my_reaction: m.my_reaction.clone(),
+        peer_reaction: m.peer_reaction.clone(),
+        money_alert: chat.money_alert(m),
+    }
 }
 
 fn conversation_info(c: &Conversation) -> ConversationInfo {
@@ -114,6 +162,7 @@ fn conversation_info(c: &Conversation) -> ConversationInfo {
         last_at_ms: c.last_at_ms,
         last_outgoing: c.last_outgoing,
         last_status: c.last_status.into(),
+        last_deleted: c.last_deleted,
         unread: c.unread,
     }
 }
@@ -133,6 +182,31 @@ pub fn qr_image(text: String) -> Option<QrImage> {
         }
     }
     Some(QrImage { size: q.size as u32, modules })
+}
+
+/// Nome que vem dentro de um código de contato (para avisar de nome parecido antes de adicionar).
+#[uniffi::export]
+pub fn card_name(card: String) -> Option<String> {
+    parse_card(&card).map(|c| c.name)
+}
+
+/// Relays públicos usados por padrão.
+#[uniffi::export]
+pub fn default_relays() -> Vec<String> {
+    nostr::DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect()
+}
+
+/// Interpreta uma mensagem de texto vinda de um relay.
+#[uniffi::export]
+pub fn parse_relay_message(text: String) -> RelayEvent {
+    let blank = RelayEvent { kind: RelayKind::Other, data: None, created_at: 0, ok: false, info: String::new() };
+    match nostr::parse(&text) {
+        RelayMessage::Envelope { data, created_at } => RelayEvent { kind: RelayKind::Envelope, data: Some(data), created_at, ..blank },
+        RelayMessage::EndOfStored => RelayEvent { kind: RelayKind::EndOfStored, ..blank },
+        RelayMessage::Accepted { ok, reason } => RelayEvent { kind: RelayKind::Accepted, ok, info: reason, ..blank },
+        RelayMessage::Notice(n) => RelayEvent { kind: RelayKind::Notice, info: n, ..blank },
+        RelayMessage::Other => blank,
+    }
 }
 
 #[derive(uniffi::Object)]
@@ -161,9 +235,20 @@ impl Messenger {
         Ok(Arc::new(Self { chat: Mutex::new(Chat::load(&data)?) }))
     }
 
+    /// Restaura de um backup cifrado com senha.
+    #[uniffi::constructor]
+    pub fn restore_backup(data: Vec<u8>, password: String) -> Result<Arc<Self>, NmError> {
+        Ok(Arc::new(Self { chat: Mutex::new(backup::restore(&data, &password)?) }))
+    }
+
     /// Estado completo (inclui a chave secreta): guarde só no armazenamento privado do app.
     pub fn save(&self) -> Vec<u8> {
         self.chat().save()
+    }
+
+    /// Backup cifrado com senha, para guardar fora do app.
+    pub fn export_backup(&self, password: String) -> Result<Vec<u8>, NmError> {
+        Ok(backup::export(&self.chat(), &password)?)
     }
 
     pub fn my_name(&self) -> String {
@@ -187,8 +272,16 @@ impl Messenger {
         self.chat().my_card()
     }
 
+    // ---------- contatos e escudo ----------
+
     pub fn add_contact(&self, card: String) -> Result<ContactInfo, NmError> {
         Ok(contact_info(&self.chat().add_contact(&card)?))
+    }
+
+    /// Contatos com nome igual ou parecido ao do código, antes de adicioná-lo.
+    pub fn similar_contacts(&self, card: String) -> Vec<ContactInfo> {
+        let Some(c) = parse_card(&card) else { return Vec::new() };
+        self.chat().similar_contacts(&c.name, Some(&c.key)).iter().map(contact_info).collect()
     }
 
     pub fn rename_contact(&self, peer_id: String, name: String) -> Result<(), NmError> {
@@ -204,21 +297,82 @@ impl Messenger {
         self.chat().contact(&k).map(contact_info)
     }
 
+    pub fn money_alerts(&self) -> bool {
+        self.chat().money_alerts()
+    }
+
+    pub fn set_money_alerts(&self, on: bool) {
+        self.chat().set_money_alerts(on);
+    }
+
+    pub fn dismiss_alert(&self, message_id: u64) -> bool {
+        self.chat().dismiss_alert(message_id)
+    }
+
+    // ---------- conversas ----------
+
     pub fn conversations(&self) -> Vec<ConversationInfo> {
         self.chat().conversations().iter().map(conversation_info).collect()
     }
 
     pub fn messages(&self, peer_id: String) -> Result<Vec<MessageInfo>, NmError> {
-        Ok(self.chat().messages(&peer(&peer_id)?).iter().map(message_info).collect())
+        let chat = self.chat();
+        Ok(chat.messages(&peer(&peer_id)?).iter().map(|m| message_info(&chat, m)).collect())
+    }
+
+    pub fn message(&self, message_id: u64) -> Option<MessageInfo> {
+        let chat = self.chat();
+        chat.message(message_id).map(|m| message_info(&chat, m))
+    }
+
+    pub fn search(&self, query: String) -> Vec<MessageInfo> {
+        let chat = self.chat();
+        chat.search(&query).iter().map(|m| message_info(&chat, m)).collect()
     }
 
     pub fn send_text(&self, peer_id: String, text: String, now_ms: u64) -> Result<MessageInfo, NmError> {
-        Ok(message_info(&self.chat().send_text(&peer(&peer_id)?, &text, now_ms)?))
+        let mut chat = self.chat();
+        let m = chat.send_text(&peer(&peer_id)?, &text, now_ms)?;
+        Ok(message_info(&chat, &m))
     }
 
-    /// O que mandar ao conectar com outro aparelho.
+    pub fn send_reply(&self, peer_id: String, text: String, reply_to: u64, now_ms: u64) -> Result<MessageInfo, NmError> {
+        let mut chat = self.chat();
+        let m = chat.send_reply(&peer(&peer_id)?, &text, reply_to, now_ms)?;
+        Ok(message_info(&chat, &m))
+    }
+
+    pub fn edit_message(&self, message_id: u64, text: String, now_ms: u64) -> Result<(), NmError> {
+        Ok(self.chat().edit_message(message_id, &text, now_ms)?)
+    }
+
+    pub fn delete_for_everyone(&self, message_id: u64, now_ms: u64) -> Result<(), NmError> {
+        Ok(self.chat().delete_for_everyone(message_id, now_ms)?)
+    }
+
+    pub fn delete_for_me(&self, message_id: u64) -> bool {
+        self.chat().delete_for_me(message_id)
+    }
+
+    /// Emoji vazio tira a reação.
+    pub fn react(&self, message_id: u64, emoji: String, now_ms: u64) -> Result<(), NmError> {
+        Ok(self.chat().react(message_id, &emoji, now_ms)?)
+    }
+
+    /// Marca a conversa como lida e prepara as confirmações (✓✓ azul do outro lado).
+    pub fn mark_read(&self, peer_id: String) -> Result<u32, NmError> {
+        Ok(self.chat().mark_read(&peer(&peer_id)?) as u32)
+    }
+
+    // ---------- transporte ----------
+
+    pub fn has_outgoing(&self) -> bool {
+        self.chat().has_outgoing()
+    }
+
+    /// O que mandar agora (por todos os transportes disponíveis).
     pub fn outbox(&self) -> Vec<OutgoingPacket> {
-        self.chat().outbox().into_iter().map(|o| OutgoingPacket { message_id: o.message_id, data: o.data }).collect()
+        self.chat().outbox().into_iter().map(|o| OutgoingPacket { message_id: o.message_id, to_peer_id: key_id(&o.to), data: o.data }).collect()
     }
 
     /// A mensagem saiu por algum transporte (✓). Devolve `true` se mudou.
@@ -227,13 +381,19 @@ impl Messenger {
     }
 
     pub fn receive(&self, data: Vec<u8>, now_ms: u64) -> ReceiveResult {
-        let r = self.chat().receive(&data, now_ms);
-        ReceiveResult { message: r.message.as_ref().map(message_info), updated: r.updated, not_for_me: r.not_for_me }
+        let mut chat = self.chat();
+        let r = chat.receive(&data, now_ms);
+        ReceiveResult { message: r.message.as_ref().map(|m| message_info(&chat, m)), updated: r.updated, changed: r.changed, not_for_me: r.not_for_me }
     }
 
-    /// Marca a conversa como lida e prepara as confirmações (✓✓ azul do outro lado).
-    pub fn mark_read(&self, peer_id: String) -> Result<u32, NmError> {
-        Ok(self.chat().mark_read(&peer(&peer_id)?) as u32)
+    /// Evento Nostr `["EVENT", …]` levando `data` para `to_peer_id` pela internet.
+    pub fn relay_event(&self, to_peer_id: String, data: Vec<u8>, now_s: u64) -> Result<String, NmError> {
+        Ok(nostr::event(&peer(&to_peer_id)?, &data, now_s))
+    }
+
+    /// Pedido `["REQ", …]` das mensagens para este aparelho desde `since_s`.
+    pub fn relay_request(&self, subscription: String, since_s: u64) -> String {
+        nostr::request(&subscription, self.chat().my_key(), since_s)
     }
 }
 
@@ -247,15 +407,17 @@ mod tests {
         let b = Messenger::create("Bruno".into());
         let bc = a.add_contact(b.my_card()).unwrap();
         b.add_contact(a.my_card()).unwrap();
-        assert_eq!(bc.name, "Bruno");
-        let sent = a.send_text(bc.peer_id.clone(), "oi".into(), 1).unwrap();
+        assert!(bc.added_in_person);
+        let sent = a.send_text(bc.peer_id.clone(), "me manda um pix".into(), 1).unwrap();
         assert_eq!(sent.status, MessageStatus::Pending);
+        assert!(!sent.money_alert, "não alerta em mensagem enviada");
         for p in a.outbox() {
+            assert_eq!(p.to_peer_id, b.my_id());
             if let Some(id) = p.message_id {
                 a.mark_sent(id);
             }
             let r = b.receive(p.data, 2);
-            assert_eq!(r.message.unwrap().text, "oi");
+            assert!(r.message.unwrap().money_alert);
         }
         for p in b.outbox() {
             assert_eq!(a.receive(p.data, 3).updated, vec![sent.id]);
@@ -267,5 +429,32 @@ mod tests {
         assert!(Messenger::restore(vec![1, 2, 3]).is_err());
         let q = qr_image(a.my_card()).unwrap();
         assert_eq!(q.modules.len() as u32, q.size * q.size);
+        assert_eq!(card_name(b.my_card()).as_deref(), Some("Bruno"));
+        let impostor = Messenger::create("bruno".into());
+        assert_eq!(a.similar_contacts(impostor.my_card()).len(), 1);
+    }
+
+    #[test]
+    fn internet_path_and_backup() {
+        let a = Messenger::create("Ana".into());
+        let b = Messenger::create("Bruno".into());
+        a.add_contact(b.my_card()).unwrap();
+        b.add_contact(a.my_card()).unwrap();
+        a.send_text(b.my_id(), "pela internet".into(), 1).unwrap();
+        // A manda pelo relay; o relay devolve o evento para B, que o recebe.
+        let p = a.outbox().remove(0);
+        let ev = a.relay_event(p.to_peer_id, p.data, 1_800_000_000).unwrap();
+        let sent: serde_json::Value = serde_json::from_str(&ev).unwrap();
+        let relayed = serde_json::json!(["EVENT", "nm", sent[1]]).to_string();
+        let e = parse_relay_message(relayed);
+        assert_eq!(e.kind, RelayKind::Envelope);
+        let r = b.receive(e.data.unwrap(), 2);
+        assert_eq!(r.message.unwrap().text, "pela internet");
+        assert!(b.relay_request("nm".into(), 0).contains("\"#p\""));
+        assert!(!default_relays().is_empty());
+
+        let file = a.export_backup("senha123".into()).unwrap();
+        assert!(matches!(Messenger::restore_backup(file.clone(), "errada".into()), Err(NmError::Chat(m)) if m == "senha incorreta"));
+        assert_eq!(Messenger::restore_backup(file, "senha123".into()).unwrap().my_id(), a.my_id());
     }
 }

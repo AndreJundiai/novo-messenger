@@ -5,9 +5,12 @@
 //! puder (Bluetooth, Wi-Fi direto, LoRa, luz, som, QR) e devolve o que
 //! receber para [`Chat::receive`].
 
+pub mod backup;
 pub mod card;
 pub mod chat;
 pub mod crypto;
+pub mod nostr;
+pub mod shield;
 mod wire;
 
 pub use card::{parse_card, Card};

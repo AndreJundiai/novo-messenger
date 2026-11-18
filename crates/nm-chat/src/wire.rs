@@ -1,20 +1,49 @@
 //! Conteúdo de dentro do envelope e leitura/escrita binária simples.
 
 /// O que vai cifrado dentro do envelope.
+///
+/// Todo conteúdo (menos as confirmações) tem um `id` próprio, e quem recebe
+/// devolve "entregue" com esse `id`. Assim, edições, exclusões e reações
+/// também são reenviadas até chegar.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Body {
+    /// Formato antigo (fase 1), ainda aceito.
     Text { id: u64, text: String },
     Delivered(Vec<u64>),
     Read(Vec<u64>),
+    /// Mensagem, opcionalmente respondendo a outra.
+    Message { id: u64, reply_to: Option<u64>, text: String },
+    Edit { id: u64, target: u64, text: String },
+    Delete { id: u64, target: u64 },
+    /// Emoji vazio = tirar a reação.
+    React { id: u64, target: u64, emoji: String },
 }
 
 const TEXT: u8 = 1;
 const DELIVERED: u8 = 2;
 const READ: u8 = 3;
+const MESSAGE: u8 = 4;
+const EDIT: u8 = 5;
+const DELETE: u8 = 6;
+const REACT: u8 = 7;
 /// Quantas confirmações cabem num envelope.
 pub const MAX_ACKS: usize = 64;
+/// Maior emoji de reação, em bytes (alguns emojis compostos passam de 20).
+pub const MAX_EMOJI_BYTES: usize = 32;
+
+fn utf8(b: &[u8]) -> Option<String> {
+    String::from_utf8(b.to_vec()).ok()
+}
 
 impl Body {
+    /// `id` do conteúdo (para confirmar a entrega); `None` nas confirmações.
+    pub fn id(&self) -> Option<u64> {
+        match self {
+            Body::Text { id, .. } | Body::Message { id, .. } | Body::Edit { id, .. } | Body::Delete { id, .. } | Body::React { id, .. } => Some(*id),
+            Body::Delivered(_) | Body::Read(_) => None,
+        }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::default();
         match self {
@@ -29,16 +58,45 @@ impl Body {
                     w.u64(*id);
                 }
             }
+            Body::Message { id, reply_to, text } => {
+                w.u8(MESSAGE);
+                w.u64(*id);
+                match reply_to {
+                    Some(r) => {
+                        w.u8(1);
+                        w.u64(*r);
+                    }
+                    None => w.u8(0),
+                }
+                w.raw(text.as_bytes());
+            }
+            Body::Edit { id, target, text } => {
+                w.u8(EDIT);
+                w.u64(*id);
+                w.u64(*target);
+                w.raw(text.as_bytes());
+            }
+            Body::Delete { id, target } => {
+                w.u8(DELETE);
+                w.u64(*id);
+                w.u64(*target);
+            }
+            Body::React { id, target, emoji } => {
+                w.u8(REACT);
+                w.u64(*id);
+                w.u64(*target);
+                w.raw(emoji.as_bytes());
+            }
         }
         w.0
     }
 
     pub fn decode(b: &[u8]) -> Option<Self> {
         let mut r = Reader::new(b);
-        match r.u8()? {
+        Some(match r.u8()? {
             TEXT => {
                 let id = r.u64()?;
-                Some(Body::Text { id, text: String::from_utf8(r.rest().to_vec()).ok()? })
+                Body::Text { id, text: utf8(r.rest())? }
             }
             kind @ (DELIVERED | READ) => {
                 let rest = r.rest();
@@ -46,10 +104,42 @@ impl Body {
                     return None;
                 }
                 let ids = rest.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap_or_default())).collect();
-                Some(if kind == DELIVERED { Body::Delivered(ids) } else { Body::Read(ids) })
+                if kind == DELIVERED {
+                    Body::Delivered(ids)
+                } else {
+                    Body::Read(ids)
+                }
             }
-            _ => None,
-        }
+            MESSAGE => {
+                let id = r.u64()?;
+                let reply_to = match r.u8()? {
+                    0 => None,
+                    1 => Some(r.u64()?),
+                    _ => return None,
+                };
+                Body::Message { id, reply_to, text: utf8(r.rest())? }
+            }
+            EDIT => {
+                let (id, target) = (r.u64()?, r.u64()?);
+                Body::Edit { id, target, text: utf8(r.rest())? }
+            }
+            DELETE => {
+                let (id, target) = (r.u64()?, r.u64()?);
+                if !r.done() {
+                    return None;
+                }
+                Body::Delete { id, target }
+            }
+            REACT => {
+                let (id, target) = (r.u64()?, r.u64()?);
+                let emoji = utf8(r.rest())?;
+                if emoji.len() > MAX_EMOJI_BYTES {
+                    return None;
+                }
+                Body::React { id, target, emoji }
+            }
+            _ => return None,
+        })
     }
 }
 
@@ -126,11 +216,24 @@ mod tests {
 
     #[test]
     fn bodies_roundtrip() {
-        for b in [Body::Text { id: 7, text: "oi ✂️".into() }, Body::Delivered(vec![1, 2, u64::MAX]), Body::Read(vec![3])] {
+        for b in [
+            Body::Text { id: 7, text: "oi ✂️".into() },
+            Body::Delivered(vec![1, 2, u64::MAX]),
+            Body::Read(vec![3]),
+            Body::Message { id: 8, reply_to: Some(7), text: "respondendo".into() },
+            Body::Message { id: 9, reply_to: None, text: String::new() },
+            Body::Edit { id: 10, target: 8, text: "corrigido".into() },
+            Body::Delete { id: 11, target: 8 },
+            Body::React { id: 12, target: 8, emoji: "👍🏽".into() },
+            Body::React { id: 13, target: 8, emoji: String::new() },
+        ] {
             assert_eq!(Body::decode(&b.encode()), Some(b));
         }
         assert_eq!(Body::decode(&[2, 1, 2]), None);
         assert_eq!(Body::decode(&[9]), None);
         assert_eq!(Body::decode(&[]), None);
+        assert_eq!(Body::decode(&[4, 0, 0, 0, 0, 0, 0, 0, 0, 2]), None, "marcador de resposta inválido");
+        assert_eq!(Body::React { id: 1, target: 2, emoji: "x".repeat(40) }.encode().len(), 57);
+        assert_eq!(Body::decode(&Body::React { id: 1, target: 2, emoji: "x".repeat(40) }.encode()), None);
     }
 }

@@ -36,17 +36,22 @@ object Notifications {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
 
-    fun mesh(ctx: Context, peers: Int): Notification =
+    /** "Internet ✓ · 2 aparelhos por perto", "Sem internet · procurando aparelhos…" etc. */
+    fun networkSummary(peers: Int, relays: Int): String {
+        val net = if (relays > 0) "Internet ✓" else "Sem internet"
+        val near = when (peers) {
+            0 -> "procurando aparelhos por perto"
+            1 -> "1 aparelho por perto"
+            else -> "$peers aparelhos por perto"
+        }
+        return "$net · $near"
+    }
+
+    fun mesh(ctx: Context, peers: Int, relays: Int): Notification =
         NotificationCompat.Builder(ctx, CH_MESH)
             .setSmallIcon(R.drawable.ic_stat_mesh)
             .setContentTitle("Novo Messenger")
-            .setContentText(
-                when (peers) {
-                    0 -> "Procurando aparelhos por perto…"
-                    1 -> "Conectado a 1 aparelho"
-                    else -> "Conectado a $peers aparelhos"
-                },
-            )
+            .setContentText(networkSummary(peers, relays))
             .setOngoing(true)
             .setSilent(true)
             .setContentIntent(openApp(ctx))

@@ -36,6 +36,8 @@ A mensagem escolhe sozinha o caminho que existir. Quem usa só vê ✓ / ✓✓ 
 |---|---|---|
 | **0 ✅** | Núcleo Rust: luz, som, QR, LoRa, correção de erros, histórico CRDT, ponte | feito |
 | **1** | App Android com a cara do WhatsApp: conversas, ✓/✓✓/azul, contato por QR (sem número de telefone), criptografia de ponta a ponta, conexão direta celular a celular | duas pessoas conversam a 20 m com o app em segundo plano |
+| **1.1** | Internet normal (relays Nostr); responder, reagir, editar, apagar, buscar; escudo contra golpes; backup cifrado (docs/PESQUISA.md) | duas pessoas em cidades diferentes conversam pela internet; o alerta aparece num pedido de Pix |
+| **1.2** | Grupos (com convite e consentimento), áudio, fotos | grupo de 5 pessoas funcionando com e sem internet |
 | **2** | Malha de celulares e pombo-correio: cada celular guarda e repassa mensagens cifradas dos outros, sem conseguir lê-las | mensagem atravessa 3 celulares e chega mesmo se o destinatário aparecer 2 h depois |
 | **3** | Longa distância: rádio LoRa de bolso + repetidor solar com firmware próprio; áudio curto por rádio (Codec2, ~2 KB para 10 s) | 20 km com 2 repetidores; 50 km+ com visada livre |
 | **4** | Sincronização pela internet quando aparecer; versão iPhone | mensagem atravessa uma cidade por meios mistos |

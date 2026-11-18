@@ -19,6 +19,7 @@ import java.util.concurrent.Executors
 class Repo(private val context: Context) {
     private val file = File(context.filesDir, "nm-state.bin")
     private val io = Executors.newSingleThreadExecutor()
+    private val prefs = context.getSharedPreferences("nm", Context.MODE_PRIVATE)
 
     var messenger: Messenger? = null
         private set
@@ -26,8 +27,14 @@ class Repo(private val context: Context) {
     /** Aumenta a cada mudança, para a interface se redesenhar. */
     val revision = MutableStateFlow(0)
 
-    /** Quantos aparelhos estão conectados agora. */
+    /** Aparelhos conectados por perto (Bluetooth/Wi-Fi direto). */
     val peers = MutableStateFlow(0)
+
+    /** Relays de internet conectados. */
+    val relays = MutableStateFlow(0)
+
+    /** Usar a internet (relays Nostr) quando houver conexão. */
+    val internetEnabled = MutableStateFlow(prefs.getBoolean("internet", true))
 
     /** O app está na tela (para não notificar à toa). */
     @Volatile var foreground = false
@@ -37,6 +44,9 @@ class Repo(private val context: Context) {
 
     /** O serviço de rede chama isto para mandar o que estiver na caixa de saída. */
     @Volatile var onOutboxChanged: (() -> Unit)? = null
+
+    /** O serviço de rede liga ou desliga a internet quando a preferência muda. */
+    @Volatile var onInternetToggled: ((Boolean) -> Unit)? = null
 
     init {
         if (file.exists()) {
@@ -57,7 +67,7 @@ class Repo(private val context: Context) {
         changed()
     }
 
-    private fun now(): ULong = System.currentTimeMillis().toULong()
+    private fun nowMs(): ULong = System.currentTimeMillis().toULong()
 
     /** Salva em segundo plano, trocando o arquivo de uma vez (sem arquivo pela metade). */
     private fun changed() {
@@ -73,43 +83,76 @@ class Repo(private val context: Context) {
         }
     }
 
+    private inline fun <T> attempt(block: (Messenger) -> T): Result<T> {
+        val m = messenger ?: return Result.failure(IllegalStateException("sem identidade"))
+        return try {
+            Result.success(block(m))
+        } catch (e: NmException) {
+            Result.failure(e)
+        }
+    }
+
+    /** Executa uma ação que muda a conversa e manda o resultado pela rede. */
+    private inline fun <T> action(block: (Messenger) -> T): Result<T> =
+        attempt(block).onSuccess {
+            changed()
+            onOutboxChanged?.invoke()
+        }
+
+    // ---------- identidade ----------
+
     fun myName(): String = messenger?.myName().orEmpty()
     fun myCard(): String = messenger?.myCard().orEmpty()
     fun mySafetyCode(): String = messenger?.mySafetyCode().orEmpty()
     fun myId(): String = messenger?.myId().orEmpty()
 
-    fun conversations(): List<ConversationInfo> = messenger?.conversations().orEmpty()
+    fun setMyName(name: String) {
+        messenger?.setMyName(name)
+        changed()
+    }
+
+    // ---------- contatos e escudo ----------
+
     fun contacts(): List<ContactInfo> = messenger?.contacts().orEmpty()
     fun contact(peerId: String): ContactInfo? = messenger?.contact(peerId)
 
-    fun messages(peerId: String): List<MessageInfo> = try {
-        messenger?.messages(peerId).orEmpty()
-    } catch (e: NmException) {
-        emptyList()
+    /** Contatos com nome parecido ao do código lido (golpe do "troquei de número"). */
+    fun similarContacts(card: String): List<ContactInfo> = messenger?.similarContacts(card).orEmpty()
+
+    fun addContact(card: String): Result<ContactInfo> = attempt { it.addContact(card) }.onSuccess { changed() }
+
+    fun moneyAlerts(): Boolean = messenger?.moneyAlerts() ?: true
+
+    fun setMoneyAlerts(on: Boolean) {
+        messenger?.setMoneyAlerts(on)
+        changed()
     }
 
-    fun addContact(card: String): Result<ContactInfo> {
-        val m = messenger ?: return Result.failure(IllegalStateException("sem identidade"))
-        return try {
-            val c = m.addContact(card)
-            changed()
-            Result.success(c)
-        } catch (e: NmException) {
-            Result.failure(e)
-        }
+    fun dismissAlert(id: ULong) {
+        if (messenger?.dismissAlert(id) == true) changed()
     }
 
-    fun send(peerId: String, text: String): Result<MessageInfo> {
-        val m = messenger ?: return Result.failure(IllegalStateException("sem identidade"))
-        return try {
-            val msg = m.sendText(peerId, text, now())
-            changed()
-            onOutboxChanged?.invoke()
-            Result.success(msg)
-        } catch (e: NmException) {
-            Result.failure(e)
-        }
+    // ---------- conversas ----------
+
+    fun conversations(): List<ConversationInfo> = messenger?.conversations().orEmpty()
+
+    fun messages(peerId: String): List<MessageInfo> = attempt { it.messages(peerId) }.getOrDefault(emptyList())
+
+    fun search(query: String): List<MessageInfo> = messenger?.search(query).orEmpty()
+
+    fun send(peerId: String, text: String, replyTo: ULong?): Result<MessageInfo> = action {
+        if (replyTo != null) it.sendReply(peerId, text, replyTo, nowMs()) else it.sendText(peerId, text, nowMs())
     }
+
+    fun edit(id: ULong, text: String): Result<Unit> = action { it.editMessage(id, text, nowMs()) }
+
+    fun deleteForEveryone(id: ULong): Result<Unit> = action { it.deleteForEveryone(id, nowMs()) }
+
+    fun deleteForMe(id: ULong) {
+        if (messenger?.deleteForMe(id) == true) changed()
+    }
+
+    fun react(id: ULong, emoji: String): Result<Unit> = action { it.react(id, emoji, nowMs()) }
 
     fun markRead(peerId: String) {
         val m = messenger ?: return
@@ -122,6 +165,48 @@ class Repo(private val context: Context) {
         }
     }
 
+    // ---------- backup ----------
+
+    fun exportBackup(password: String): Result<ByteArray> = attempt { it.exportBackup(password) }
+
+    /** Troca tudo deste aparelho pelo conteúdo do backup. */
+    fun restoreBackup(data: ByteArray, password: String): Result<Unit> = try {
+        messenger = Messenger.restoreBackup(data, password)
+        changed()
+        onOutboxChanged?.invoke()
+        Result.success(Unit)
+    } catch (e: NmException) {
+        Result.failure(e)
+    }
+
+    // ---------- internet ----------
+
+    fun setInternetEnabled(on: Boolean) {
+        prefs.edit().putBoolean("internet", on).apply()
+        internetEnabled.value = on
+        onInternetToggled?.invoke(on)
+    }
+
+    /** Pedido aos relays: mensagens desde a última vista (com 1 h de folga), ou dos últimos 7 dias. */
+    fun relayRequest(subscription: String): String {
+        val nowS = System.currentTimeMillis() / 1000
+        val last = prefs.getLong("relay_seen", 0L)
+        val since = if (last > 0) last - 3600 else nowS - 7 * 24 * 3600
+        return messenger?.relayRequest(subscription, since.coerceAtLeast(0).toULong()).orEmpty()
+    }
+
+    fun noteRelayTime(createdAt: ULong) {
+        val t = createdAt.toLong()
+        if (t > prefs.getLong("relay_seen", 0L)) prefs.edit().putLong("relay_seen", t).apply()
+    }
+
+    fun relayEvent(toPeerId: String, data: ByteArray): String? =
+        attempt { it.relayEvent(toPeerId, data, (System.currentTimeMillis() / 1000).toULong()) }.getOrNull()
+
+    // ---------- transporte ----------
+
+    fun hasOutgoing(): Boolean = messenger?.hasOutgoing() == true
+
     fun outbox(): List<OutgoingPacket> = messenger?.outbox().orEmpty()
 
     fun markSent(id: ULong) {
@@ -131,10 +216,10 @@ class Repo(private val context: Context) {
     /** Envelope que chegou por algum transporte. */
     fun receive(data: ByteArray) {
         val m = messenger ?: return
-        val r = m.receive(data, now())
+        val r = m.receive(data, nowMs())
         val msg = r.message
-        if (msg == null && r.updated.isEmpty()) {
-            // Cópia repetida ou confirmação já conhecida: pode haver confirmação nova para mandar.
+        if (msg == null && r.updated.isEmpty() && r.changed.isEmpty()) {
+            // Cópia repetida: pode haver confirmação nova para mandar.
             onOutboxChanged?.invoke()
             return
         }
@@ -145,7 +230,8 @@ class Repo(private val context: Context) {
                 markRead(msg.peerId)
             } else {
                 val name = contact(msg.peerId)?.name ?: "Contato"
-                Notifications.message(context, msg.peerId, name, msg.text)
+                val text = if (msg.moneyAlert) "⚠ Pedido de dinheiro: ${msg.text}" else msg.text
+                Notifications.message(context, msg.peerId, name, text)
             }
         }
         onOutboxChanged?.invoke()

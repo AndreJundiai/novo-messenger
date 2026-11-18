@@ -17,9 +17,17 @@ Além disso:
 - **Histórico local-first (CRDT):** a conversa fica salva no aparelho e pode ser exportada num arquivo `.nmlog`. Importar junta as conversas sem duplicar nada, em qualquer ordem, então dá para sincronizar por Bluetooth ou cabo, sem servidor.
 - **Modo ponte:** um aparelho repassa para os outros canais marcados o que chega por um canal. Por exemplo: ouve por som e manda pelo rádio LoRa, alcançando quilômetros. Cada mensagem tem um limite de repasses (TTL), então não fica em ciclo.
 
-## App Android (fase 1)
+## App Android
 
-A pasta `android/` tem o app nativo com a cara de um mensageiro moderno: lista de conversas, ✓ / ✓✓ / ✓✓ azul, contato adicionado por QR (sem número de telefone) e criptografia de ponta a ponta. Os celulares se conectam direto por Bluetooth e Wi-Fi, sem internet, e o app continua recebendo com a tela desligada.
+A pasta `android/` tem o app nativo, com a cara de um mensageiro moderno:
+
+- **Com e sem internet:** com conexão, as mensagens vão por relays públicos do [Nostr](https://nostr.com) (sem servidor próprio); sem conexão, vão direto de celular em celular por Bluetooth e Wi-Fi. O app escolhe sozinho e descarta cópias.
+- **Do WhatsApp e do Telegram:** ✓ / ✓✓ / ✓✓ azul, responder citando, reagir com emoji, editar, apagar para todos, apagar para mim e busca nas conversas.
+- **Escudo contra golpes:** contato só entra pelo QR, pessoalmente (sem número de telefone); aviso de nome parecido ("troquei de número"); alerta quando uma mensagem pede Pix, transferência ou código. Tudo analisado no próprio aparelho.
+- **Backup cifrado com senha, sem nuvem.**
+- Criptografia de ponta a ponta em todos os caminhos; os relays da internet só veem dados cifrados.
+
+O porquê de cada escolha está em [docs/PESQUISA.md](docs/PESQUISA.md).
 
 - **Baixar o APK:** aba **Actions** → "App Android" → última execução → artefato `novo-messenger-apk`.
 - **Compilar na sua máquina:** precisa do Android SDK + NDK, Rust e `cargo install cargo-ndk`. Depois `./android/build-rust.sh` e `cd android && ./gradlew assembleDebug`.
@@ -67,7 +75,7 @@ crates/nm-core/            protocolo e processamento de sinal (biblioteca)
   src/mesh.rs              mensagens de texto do Meshtastic
 crates/nm-wasm/            ponte WebAssembly (C ABI)
 crates/nm-cli/             programa de terminal `nm`
-crates/nm-chat/            conversas: identidade, criptografia, confirmações ✓✓
+crates/nm-chat/            conversas: identidade, criptografia, confirmações ✓✓, escudo, backup, Nostr
 crates/nm-ffi/             ligação com Kotlin/Swift (UniFFI)
 android/                   app Android (Kotlin + Jetpack Compose)
 web/                       app (index.html, app.js, nm.js, mic-worklet.js, sw.js)

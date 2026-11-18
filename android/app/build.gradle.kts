@@ -12,8 +12,8 @@ android {
         applicationId = "app.novomessenger"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.3.0"
+        versionCode = 2
+        versionName = "0.4.0"
         ndk {
             // As bibliotecas do núcleo Rust são compiladas para estas arquiteturas (android/build-rust.sh).
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
@@ -72,6 +72,9 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:1.4.1")
     implementation("androidx.camera:camera-view:1.4.1")
     implementation("com.google.mlkit:barcode-scanning:17.3.0")
+
+    // Internet: conexão com os relays Nostr (WebSocket).
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
     // Ponte com o núcleo Rust (código gerado pelo UniFFI).
     implementation("net.java.dev.jna:jna:5.15.0@aar")

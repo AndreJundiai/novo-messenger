@@ -4,7 +4,9 @@ import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.Log
 import androidx.core.app.ServiceCompat
 import com.google.android.gms.nearby.Nearby
@@ -22,18 +24,28 @@ import com.google.android.gms.nearby.connection.PayloadTransferUpdate
 import com.google.android.gms.nearby.connection.Strategy
 
 /**
- * Mantém o celular conectado a outros aparelhos com o app por perto, por
- * Bluetooth e Wi-Fi direto (Nearby Connections), sem internet.
+ * Mantém as duas redes ligadas e manda a caixa de saída por todas que
+ * estiverem disponíveis:
  *
- * Ao conectar, cada lado manda o que tem na caixa de saída. Os envelopes já
- * vêm cifrados do núcleo Rust: a conexão em si não precisa ser confiável.
+ * - **Por perto:** Bluetooth e Wi-Fi direto (Nearby Connections), sem internet.
+ * - **Internet:** relays Nostr públicos ([NostrClient]), quando houver conexão.
+ *
+ * Os envelopes já vêm cifrados do núcleo Rust; o mesmo envelope pode chegar
+ * pelos dois caminhos, e o núcleo descarta a cópia.
  */
 class MeshService : Service() {
     private lateinit var client: ConnectionsClient
+    private lateinit var nostr: NostrClient
+    private val main = Handler(Looper.getMainLooper())
     private val connected = mutableSetOf<String>()
     private val connecting = mutableSetOf<String>()
     private val repo get() = (application as NmApplication).repo
     private var running = false
+    private var advertising = false
+    private var discovering = false
+
+    /** Quando cada envelope pendente foi publicado na internet pela última vez (evita repetir). */
+    private val publishedAt = HashMap<Int, Long>()
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -41,12 +53,13 @@ class MeshService : Service() {
         super.onCreate()
         Notifications.ensureChannels(this)
         client = Nearby.getConnectionsClient(this)
+        nostr = NostrClient(repo, onEnvelope = { repo.receive(it) }, onConnected = { flush() })
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val type = if (Build.VERSION.SDK_INT >= 29) ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE else 0
         try {
-            ServiceCompat.startForeground(this, Notifications.MESH_ID, Notifications.mesh(this, connected.size), type)
+            ServiceCompat.startForeground(this, Notifications.MESH_ID, Notifications.mesh(this, connected.size, nostr.connectedCount), type)
         } catch (e: Exception) {
             Log.e(TAG, "não foi possível iniciar em primeiro plano", e)
             stopSelf()
@@ -54,20 +67,40 @@ class MeshService : Service() {
         }
         if (!running) {
             running = true
-            repo.onOutboxChanged = { flush(connected.toList()) }
-            start()
+            repo.onOutboxChanged = { main.post { flush() } }
+            repo.onInternetToggled = { on -> main.post { if (on) nostr.start() else nostr.stop() } }
+            if (repo.internetEnabled.value) nostr.start()
+            main.postDelayed(retry, RETRY_MS)
         }
+        // Chamado de novo quando a pessoa dá a permissão de Bluetooth depois.
+        startNearby()
         return START_STICKY
+    }
+
+    /** De tempos em tempos, tenta de novo o que ainda não foi confirmado. */
+    private val retry = object : Runnable {
+        override fun run() {
+            if (repo.hasOutgoing()) flush()
+            updateNotification()
+            main.postDelayed(this, RETRY_MS)
+        }
     }
 
     private fun myEndpointName(): String = repo.myId().take(8).ifEmpty { "nm" }
 
-    private fun start() {
+    /** Liga a conexão por perto. Sem permissão de Bluetooth, falha em silêncio e a internet segue. */
+    private fun startNearby() {
         val strategy = Strategy.P2P_CLUSTER
-        client.startAdvertising(myEndpointName(), SERVICE_ID, lifecycle, AdvertisingOptions.Builder().setStrategy(strategy).build())
-            .addOnFailureListener { Log.w(TAG, "anúncio falhou", it) }
-        client.startDiscovery(SERVICE_ID, discovery, DiscoveryOptions.Builder().setStrategy(strategy).build())
-            .addOnFailureListener { Log.w(TAG, "busca falhou", it) }
+        if (!advertising) {
+            client.startAdvertising(myEndpointName(), SERVICE_ID, lifecycle, AdvertisingOptions.Builder().setStrategy(strategy).build())
+                .addOnSuccessListener { advertising = true }
+                .addOnFailureListener { Log.w(TAG, "anúncio falhou", it) }
+        }
+        if (!discovering) {
+            client.startDiscovery(SERVICE_ID, discovery, DiscoveryOptions.Builder().setStrategy(strategy).build())
+                .addOnSuccessListener { discovering = true }
+                .addOnFailureListener { Log.w(TAG, "busca falhou", it) }
+        }
     }
 
     private val discovery = object : EndpointDiscoveryCallback() {
@@ -95,7 +128,7 @@ class MeshService : Service() {
             if (result.status.isSuccess) {
                 connected += endpointId
                 updatePeers()
-                flush(listOf(endpointId))
+                flush(onlyNearby = listOf(endpointId))
             }
         }
 
@@ -117,29 +150,59 @@ class MeshService : Service() {
         override fun onPayloadTransferUpdate(endpointId: String, update: PayloadTransferUpdate) {}
     }
 
-    /** Manda a caixa de saída para os aparelhos indicados. */
-    private fun flush(endpoints: List<String>) {
-        // Sem ninguém conectado, não esvazia a caixa (as confirmações saem uma vez só).
-        if (endpoints.isEmpty()) return
+    /**
+     * Manda a caixa de saída. Com [onlyNearby], manda só para esses aparelhos
+     * (uma conexão nova); senão, para todos os aparelhos e para a internet.
+     */
+    private fun flush(onlyNearby: List<String>? = null) {
+        val nearby = onlyNearby ?: connected.toList()
+        val internet = onlyNearby == null && nostr.connectedCount > 0
+        // Sem nenhum caminho, não esvazia a caixa (as confirmações saem uma vez só).
+        if (nearby.isEmpty() && !internet) return
+        val now = System.currentTimeMillis()
         for (packet in repo.outbox()) {
-            val bytes = ByteArray(packet.data.size + 1)
-            bytes[0] = KIND_ENVELOPE
-            System.arraycopy(packet.data, 0, bytes, 1, packet.data.size)
-            client.sendPayload(endpoints, Payload.fromBytes(bytes))
-                .addOnSuccessListener { packet.messageId?.let { repo.markSent(it) } }
-                .addOnFailureListener { Log.w(TAG, "envio falhou", it) }
+            var sent = false
+            if (nearby.isNotEmpty()) {
+                val bytes = ByteArray(packet.data.size + 1)
+                bytes[0] = KIND_ENVELOPE
+                System.arraycopy(packet.data, 0, bytes, 1, packet.data.size)
+                client.sendPayload(nearby, Payload.fromBytes(bytes))
+                    .addOnSuccessListener { packet.messageId?.let { repo.markSent(it) } }
+                    .addOnFailureListener { Log.w(TAG, "envio por perto falhou", it) }
+            }
+            if (internet) {
+                // Pendentes são repetidos na internet no máximo a cada 10 minutos.
+                val key = packet.data.contentHashCode()
+                val last = publishedAt[key] ?: 0L
+                if (now - last >= REPUBLISH_MS) {
+                    val ev = repo.relayEvent(packet.toPeerId, packet.data)
+                    if (ev != null && nostr.publish(ev)) {
+                        publishedAt[key] = now
+                        sent = true
+                    }
+                }
+            }
+            if (sent) packet.messageId?.let { repo.markSent(it) }
         }
+        if (publishedAt.size > 2000) publishedAt.entries.removeIf { now - it.value > REPUBLISH_MS }
     }
 
     private fun updatePeers() {
         repo.peers.value = connected.size
+        updateNotification()
+    }
+
+    private fun updateNotification() {
         val nm = getSystemService(android.app.NotificationManager::class.java)
-        nm.notify(Notifications.MESH_ID, Notifications.mesh(this, connected.size))
+        nm.notify(Notifications.MESH_ID, Notifications.mesh(this, connected.size, nostr.connectedCount))
     }
 
     override fun onDestroy() {
+        main.removeCallbacksAndMessages(null)
         repo.onOutboxChanged = null
+        repo.onInternetToggled = null
         repo.peers.value = 0
+        nostr.stop()
         client.stopAdvertising()
         client.stopDiscovery()
         client.stopAllEndpoints()
@@ -150,5 +213,7 @@ class MeshService : Service() {
         private const val TAG = "NmMesh"
         private const val SERVICE_ID = "app.novomessenger.mesh"
         private const val KIND_ENVELOPE: Byte = 1
+        private const val RETRY_MS = 120_000L
+        private const val REPUBLISH_MS = 600_000L
     }
 }
